@@ -49,6 +49,7 @@ async def process_queue_item(
     bot: Bot,
     session_manager: SessionManager,
     tmux_manager: TmuxManager,
+    topic_config: TopicConfig | None = None,
     backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Send a queued prompt to CC; on session change, notify the user."""
@@ -88,6 +89,7 @@ async def process_queue_item(
         channel_key,
         prompt,
         tmux_manager=tmux_manager,
+        topic_config=topic_config,
         backend_dispatcher=backend_dispatcher,
     )
 
@@ -141,6 +143,7 @@ async def _start() -> None:
             bot=bot,
             session_manager=session_manager,
             tmux_manager=tmux_manager,
+            topic_config=topic_config,
             backend_dispatcher=dispatcher,
         )
 
