@@ -182,25 +182,39 @@ async def send_to_tmux_if_active(
     prompt: str,
     source_msg: Message,
     tmux_manager: TmuxManager,
+    dispatcher: BackendDispatcher | None = None,
 ) -> bool:
-    """Send prompt directly to tmux CC stdin if a tail is active.
+    """Send prompt directly to the active backend's stdin if a tail is active.
 
-    Returns True if dispatched to tmux (caller should return immediately),
-    False if not in active tmux tail (caller should enqueue normally).
+    Returns True if dispatched to the backend (caller should return immediately),
+    False if not in active tail (caller should enqueue normally).
 
     Always creates a new "Thinking..." placeholder and rotates the live
-    buffer, even when CC is already processing — so status events for
-    subsequent prompts appear in a fresh message rather than the original.
-    N rapid messages produce N placeholders; each idles until CC reaches it.
+    buffer, even when the backend is already processing — so status events
+    for subsequent prompts appear in a fresh message rather than the
+    original. N rapid messages produce N placeholders; each idles until the
+    backend reaches it.
+
+    Per-channel methods (``is_active`` / ``is_tailing`` / ``send_direct`` /
+    ``close_buffer``) route through ``dispatcher`` when supplied so codex
+    topics talk to ``CodexSessionManager``. ``tmux_manager`` is still used
+    for shared infra (``live_buffer_available`` / ``get_live_bot`` /
+    ``set_buffer`` / ``get_topic_config``) which has no codex equivalent.
     """
+    topic_config = tmux_manager.get_topic_config()
+    backend: SessionBackend | TmuxManager
+    if dispatcher is not None:
+        backend = _backend_for(dispatcher, topic_config, key)  # type: ignore[arg-type]
+    else:
+        backend = tmux_manager
     msg_id = source_msg.message_id
-    if not (tmux_manager.is_active(key) and tmux_manager.is_tailing(key)):
+    if not (backend.is_active(key) and backend.is_tailing(key)):
         logger.info(
             "MSG_TRACE send_to_tmux_if_active skip channel=%s msg=%d active=%s tailing=%s",
             key,
             msg_id,
-            tmux_manager.is_active(key),
-            tmux_manager.is_tailing(key),
+            backend.is_active(key),
+            backend.is_tailing(key),
         )
         return False
     logger.info(
@@ -211,10 +225,7 @@ async def send_to_tmux_if_active(
 
     # Resolve stream_mode for this channel from topic_config on tmux_manager
     # (wired at startup). Missing wiring → legacy verbose behavior.
-    stream_mode = _resolve_stream_mode(
-        tmux_manager.get_topic_config(),  # type: ignore[arg-type]
-        key,
-    )
+    stream_mode = _resolve_stream_mode(topic_config, key)  # type: ignore[arg-type]
 
     cmd = prompt.split()[0] if prompt.startswith("/") else None
     thinking_text = t("ui.running_command", command=cmd) if cmd else t("ui.thinking")
@@ -232,7 +243,7 @@ async def send_to_tmux_if_active(
         # set_buffer closes the previous buffer atomically, covering the prior thinking page.
         await tmux_manager.set_buffer(key, new_buffer)
 
-    delivered = await tmux_manager.send_direct(key, prompt)
+    delivered = await backend.send_direct(key, prompt)
     if not delivered:
         # Modal-blocked or send-keys failure: the thinking placeholder is
         # a lie (CC never received the prompt). Roll back both the
@@ -243,7 +254,7 @@ async def send_to_tmux_if_active(
         # spawns for that next attempt.
         with contextlib.suppress(TelegramAPIError):
             await thinking_msg.delete()
-        await tmux_manager.close_buffer(key)
+        await backend.close_buffer(key)
     return True
 
 
@@ -256,6 +267,7 @@ async def ensure_exec_mode_ready(
     tmux_manager: TmuxManager,
     session_manager: SessionManager,
     source_msg: Message,
+    dispatcher: BackendDispatcher | None = None,
 ) -> bool:
     """Idempotent lazy-start for tmux mode. Returns False only on RuntimeError.
 
@@ -277,6 +289,11 @@ async def ensure_exec_mode_ready(
     and returns True.
     """
     msg_id = source_msg.message_id
+    backend: SessionBackend | TmuxManager
+    if dispatcher is not None:
+        backend = _backend_for(dispatcher, topic_config, key)
+    else:
+        backend = tmux_manager
     lock = _lazy_start_locks.setdefault(key, asyncio.Lock())
     waiting = lock.locked()
     if waiting:
@@ -286,7 +303,7 @@ async def ensure_exec_mode_ready(
             msg_id,
         )
     async with lock:
-        if tmux_manager.is_active(key):
+        if backend.is_active(key):
             logger.info(
                 "MSG_TRACE ensure_exec_mode_ready already_active channel=%s msg=%d",
                 key,
@@ -361,7 +378,7 @@ async def ensure_exec_mode_ready(
         # a proper fix (pid→sessionId pointer via ~/.claude/sessions/<pid>.json)
         # is tracked separately.
         try:
-            await tmux_manager.start_session(
+            await backend.start_session(
                 key,
                 mode=mode,
                 cwd=cwd,
