@@ -29,6 +29,55 @@ from telegram_bot.core.types import ChannelKey
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class CodexSessionRecord:
+    """Persisted Codex per-channel session metadata (subset needed for restore)."""
+
+    thread_id: str
+    cwd: str
+
+
+def load_codex_sessions(state_path: Path) -> dict[tuple[int, int | None], CodexSessionRecord]:
+    """Load persisted codex sessions, keyed by (chat_id, thread_id_or_None).
+
+    Returns an empty dict if the file is missing, the JSON is malformed, the
+    top-level is not an object, or no ``codex_sessions`` key is present.
+    Individual malformed entries (bad key shape or missing fields) are
+    skipped rather than aborting the whole load, so one bad row cannot
+    poison startup.
+
+    The ``thread_id`` in the dict key is a Telegram forum topic id (or
+    ``None`` for non-forum chats). The persisted key shape is
+    ``"chat_id:thread_id_or_None"`` to match ``CodexSessionManager._persist``.
+    """
+    try:
+        data = json.loads(state_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    raw = data.get("codex_sessions")
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[tuple[int, int | None], CodexSessionRecord] = {}
+    for key_str, info in raw.items():
+        if not isinstance(key_str, str) or not isinstance(info, dict):
+            continue
+        try:
+            chat_s, thread_s = key_str.split(":", 1)
+            chat = int(chat_s)
+            thread: int | None = None if thread_s == "None" else int(thread_s)
+            thread_id = info["thread_id"]
+            cwd = info["cwd"]
+        except (KeyError, ValueError):
+            # Skip malformed entries rather than corrupt the whole load.
+            continue
+        if not isinstance(thread_id, str) or not isinstance(cwd, str):
+            continue
+        result[(chat, thread)] = CodexSessionRecord(thread_id=thread_id, cwd=cwd)
+    return result
+
+
 @dataclass
 class TmuxSessionState:
     session_name: str
