@@ -181,7 +181,7 @@ async def _reset_channel(
     forward_batcher: ForwardBatcher,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Unified reset path for /new, /clear, and the "Новый чат" reply button.
 
@@ -190,7 +190,7 @@ async def _reset_channel(
     Otherwise → full subprocess reset + ui.new_session.
     """
     settings = topic_config.get_topic(key[1])
-    backend = _resolve_backend(dispatcher, topic_config, key, tmux_manager)
+    backend = _resolve_backend(backend_dispatcher, topic_config, key, tmux_manager)
     if backend.is_active(key):
         # clear_context respawns the tmux session; _spawn_tmux can fail
         # (tmux server shutdown race, readiness timeout, etc.). Without a
@@ -250,7 +250,7 @@ async def handle_new(
     forward_batcher: ForwardBatcher,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     key = channel_key(message)
     logger.debug("User %s requested new session", message.from_user and message.from_user.id)
@@ -262,7 +262,7 @@ async def handle_new(
         forward_batcher,
         tmux_manager,
         topic_config,
-        dispatcher,
+        backend_dispatcher,
     )
 
 
@@ -274,7 +274,7 @@ async def handle_clear(
     forward_batcher: ForwardBatcher,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     key = channel_key(message)
     logger.debug("User %s requested clear", message.from_user and message.from_user.id)
@@ -286,7 +286,7 @@ async def handle_clear(
         forward_batcher,
         tmux_manager,
         topic_config,
-        dispatcher,
+        backend_dispatcher,
     )
 
 
@@ -297,10 +297,10 @@ async def handle_cancel_command(
     message_queue: MessageQueue,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig | None = None,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     key = channel_key(message)
-    backend = _resolve_backend(dispatcher, topic_config, key, tmux_manager)
+    backend = _resolve_backend(backend_dispatcher, topic_config, key, tmux_manager)
     tmux_acted = backend.is_active(key)
     if tmux_acted:
         await backend.cancel(key)
@@ -317,11 +317,11 @@ async def handle_kill(
     message: Message,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig | None = None,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Kill the active backend session in the current topic."""
     key = channel_key(message)
-    backend = _resolve_backend(dispatcher, topic_config, key, tmux_manager)
+    backend = _resolve_backend(backend_dispatcher, topic_config, key, tmux_manager)
     if not backend.is_active(key):
         await message.answer(t("ui.tmux_not_active"))
         return
@@ -340,7 +340,7 @@ async def handle_resume(
     tmux_manager: TmuxManager,
     picker_store: PickerStore,
     bot_defaults: BotDefaults,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Open server-side picker with resumable Claude/Codex sessions."""
     key = channel_key(message)
@@ -365,7 +365,7 @@ async def handle_resume(
         )
     )
     total_pages = max(1, math.ceil(len(entries) / 8))
-    backend = _resolve_backend(dispatcher, topic_config, key, tmux_manager)
+    backend = _resolve_backend(backend_dispatcher, topic_config, key, tmux_manager)
     current_session_id = backend.get_session_id(key)
     await message.answer(
         _resume_caption(
@@ -450,7 +450,7 @@ async def on_resume_page(
     picker_store: PickerStore,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig | None = None,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     if callback.data is None or callback.message is None:
         await callback.answer()
@@ -476,7 +476,7 @@ async def on_resume_page(
     total_pages = max(1, math.ceil(len(state.entries) / 8))
     page = max(0, min(page, total_pages - 1))
     assert key is not None  # guarded by the (state.chat_id, state.thread_id) check above
-    backend = _resolve_backend(dispatcher, topic_config, key, tmux_manager)
+    backend = _resolve_backend(backend_dispatcher, topic_config, key, tmux_manager)
     current_session_id = backend.get_session_id(key)
     try:
         await callback.message.edit_text(
@@ -509,7 +509,7 @@ async def on_resume_pick(
     tmux_manager: TmuxManager,
     picker_store: PickerStore,
     bot_defaults: BotDefaults,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     if callback.data is None or callback.message is None:
         await callback.answer()
@@ -551,7 +551,9 @@ async def on_resume_pick(
     # versa) — the target engine, not the topic's currently-configured one,
     # is what actually owns the resumed session.
     resume_backend: SessionBackend | TmuxManager = (
-        dispatcher.for_engine(entry.provider) if dispatcher is not None else tmux_manager
+        backend_dispatcher.for_engine(entry.provider)
+        if backend_dispatcher is not None
+        else tmux_manager
     )
     result = await resume_backend.switch_or_start_session(
         key,
@@ -681,7 +683,7 @@ async def on_exec_mode_click(
     topic_config: TopicConfig,
     tmux_manager: TmuxManager,
     message_queue: MessageQueue,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Apply a new exec_mode for the topic the picker was posted in.
 
@@ -713,7 +715,7 @@ async def on_exec_mode_click(
 
     key = (callback.message.chat.id, thread_id)
     previous_mode = topic_config.get_topic(thread_id).exec_mode
-    backend = _resolve_backend(dispatcher, topic_config, key, tmux_manager)
+    backend = _resolve_backend(backend_dispatcher, topic_config, key, tmux_manager)
 
     if new_mode == previous_mode:
         await callback.answer(t("ui.exec_mode_already", mode=_exec_mode_label(new_mode)))
@@ -782,7 +784,7 @@ async def on_engine_click(
     tmux_manager: TmuxManager,
     message_queue: MessageQueue,
     session_manager: SessionManager,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Apply provider engine changes for the picker topic."""
     if callback.data is None or callback.message is None:
@@ -802,7 +804,7 @@ async def on_engine_click(
     # Resolve the backend *before* updating topic_config: ``is_processing``
     # and the eventual ``kill`` must target the engine that currently owns
     # this channel's state, not the new one we're about to write in.
-    previous_backend = _resolve_backend(dispatcher, topic_config, key, tmux_manager)
+    previous_backend = _resolve_backend(backend_dispatcher, topic_config, key, tmux_manager)
 
     if previous_backend.is_processing(key) or message_queue.is_busy(key):
         await callback.answer(t("ui.exec_mode_busy"), show_alert=True)

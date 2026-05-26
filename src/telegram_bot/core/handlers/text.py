@@ -49,7 +49,7 @@ async def handle_text(
     tmux_manager: TmuxManager,
     topic_config: TopicConfig,
     inbox_reply_handler: Callable[[Message, MessageQueue], Awaitable[bool]] | None = None,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     # User's own messages are trusted — no sanitize_forwarded_content() needed here.
     # If multi-user access is added, apply sanitization like in forward.py.
@@ -59,7 +59,9 @@ async def handle_text(
 
     key = channel_key(message)
     backend: SessionBackend | TmuxManager = (
-        _backend_for(dispatcher, topic_config, key) if dispatcher is not None else tmux_manager
+        _backend_for(backend_dispatcher, topic_config, key)
+        if backend_dispatcher is not None
+        else tmux_manager
     )
     logger.info(
         "MSG_TRACE handle_text channel=%s msg=%d text_len=%d user=%s",
@@ -86,10 +88,10 @@ async def handle_text(
         and topic_config.get_topic(key[1]).exec_mode == "tmux"
     ):
         if not await ensure_exec_mode_ready(
-            key, topic_config, tmux_manager, session_manager, message, dispatcher
+            key, topic_config, tmux_manager, session_manager, message, backend_dispatcher
         ):
             return
-        if await send_to_tmux_if_active(key, text, message, tmux_manager, dispatcher):
+        if await send_to_tmux_if_active(key, text, message, tmux_manager, backend_dispatcher):
             return
 
     async def on_text_only(text: str, source_msg: Message) -> None:
@@ -176,7 +178,7 @@ async def handle_text(
                     )
 
         if not await ensure_exec_mode_ready(
-            key, topic_config, tmux_manager, session_manager, source_msg, dispatcher
+            key, topic_config, tmux_manager, session_manager, source_msg, backend_dispatcher
         ):
             return
 
@@ -184,7 +186,9 @@ async def handle_text(
         # ``ensure_exec_mode_ready`` so subsequent per-channel checks talk to
         # the engine that actually owns the live session now.
         current_backend: SessionBackend | TmuxManager = (
-            _backend_for(dispatcher, topic_config, key) if dispatcher is not None else tmux_manager
+            _backend_for(backend_dispatcher, topic_config, key)
+            if backend_dispatcher is not None
+            else tmux_manager
         )
 
         target_session_id = reply_ref.session_id if reply_ref is not None else None
@@ -216,7 +220,7 @@ async def handle_text(
             target_session_id = None  # tmux manages session state internally
 
         # Tmux with active tail: send directly to CC stdin, bypass queue.
-        if await send_to_tmux_if_active(key, text, source_msg, tmux_manager, dispatcher):
+        if await send_to_tmux_if_active(key, text, source_msg, tmux_manager, backend_dispatcher):
             return
 
         enqueue_prompt(
@@ -229,7 +233,7 @@ async def handle_text(
             # tmux_switched already consumed the reply target in switch_session;
             # a second reply-context injection would double-reference it.
             inject_reply_if_no_target=not tmux_switched,
-            dispatcher=dispatcher,
+            backend_dispatcher=backend_dispatcher,
             topic_config=topic_config,
         )
 

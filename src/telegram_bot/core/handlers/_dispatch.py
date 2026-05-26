@@ -65,7 +65,7 @@ def enqueue_prompt(
     *,
     target_session_id: str | None,
     inject_reply_if_no_target: bool,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
     topic_config: TopicConfig | None = None,
 ) -> None:
     """Final enqueue step shared by text/voice/photo/forward handlers.
@@ -80,9 +80,9 @@ def enqueue_prompt(
     - Always enqueues with `suppress_notification=<backend>.is_active(key)`
       because in tmux mode the CC TUI provides its own position feedback
       (thinking placeholder, live buffer) — the queue's "added to position N"
-      message is redundant. ``dispatcher`` (optional during the Phase 10/11
-      transition) selects the engine-appropriate backend; when omitted we
-      fall back to ``tmux_manager`` (the claude-only legacy path).
+      message is redundant. ``backend_dispatcher`` (optional during the Phase
+      10/11 transition) selects the engine-appropriate backend; when omitted
+      we fall back to ``tmux_manager`` (the claude-only legacy path).
     """
     if target_session_id is None and inject_reply_if_no_target:
         reply_context = build_reply_context(source_msg)
@@ -96,8 +96,8 @@ def enqueue_prompt(
         target_session_id,
     )
     backend: SessionBackend | TmuxManager
-    if dispatcher is not None:
-        backend = _backend_for(dispatcher, topic_config, key)
+    if backend_dispatcher is not None:
+        backend = _backend_for(backend_dispatcher, topic_config, key)
     else:
         backend = tmux_manager
     message_queue.enqueue(

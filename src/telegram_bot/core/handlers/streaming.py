@@ -182,7 +182,7 @@ async def send_to_tmux_if_active(
     prompt: str,
     source_msg: Message,
     tmux_manager: TmuxManager,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> bool:
     """Send prompt directly to the active backend's stdin if a tail is active.
 
@@ -196,15 +196,15 @@ async def send_to_tmux_if_active(
     backend reaches it.
 
     Per-channel methods (``is_active`` / ``is_tailing`` / ``send_direct`` /
-    ``close_buffer``) route through ``dispatcher`` when supplied so codex
-    topics talk to ``CodexSessionManager``. ``tmux_manager`` is still used
-    for shared infra (``live_buffer_available`` / ``get_live_bot`` /
+    ``close_buffer``) route through ``backend_dispatcher`` when supplied so
+    codex topics talk to ``CodexSessionManager``. ``tmux_manager`` is still
+    used for shared infra (``live_buffer_available`` / ``get_live_bot`` /
     ``set_buffer`` / ``get_topic_config``) which has no codex equivalent.
     """
     topic_config = tmux_manager.get_topic_config()
     backend: SessionBackend | TmuxManager
-    if dispatcher is not None:
-        backend = _backend_for(dispatcher, topic_config, key)  # type: ignore[arg-type]
+    if backend_dispatcher is not None:
+        backend = _backend_for(backend_dispatcher, topic_config, key)  # type: ignore[arg-type]
     else:
         backend = tmux_manager
     msg_id = source_msg.message_id
@@ -267,7 +267,7 @@ async def ensure_exec_mode_ready(
     tmux_manager: TmuxManager,
     session_manager: SessionManager,
     source_msg: Message,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> bool:
     """Idempotent lazy-start for tmux mode. Returns False only on RuntimeError.
 
@@ -290,8 +290,8 @@ async def ensure_exec_mode_ready(
     """
     msg_id = source_msg.message_id
     backend: SessionBackend | TmuxManager
-    if dispatcher is not None:
-        backend = _backend_for(dispatcher, topic_config, key)
+    if backend_dispatcher is not None:
+        backend = _backend_for(backend_dispatcher, topic_config, key)
     else:
         backend = tmux_manager
     lock = _lazy_start_locks.setdefault(key, asyncio.Lock())
@@ -631,7 +631,7 @@ async def send_streaming_response(
     git_sync: Any | None = None,
     tmux_manager: TmuxManager | None = None,
     topic_config: TopicConfig | None = None,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Send prompt to CC with streaming and deliver response to user.
 
@@ -646,7 +646,7 @@ async def send_streaming_response(
                 for status when no buffer is available.
     All message IDs are still recorded for reply-to-resume.
 
-    ``dispatcher`` (optional during the Phase 10/11 transition) routes
+    ``backend_dispatcher`` (optional during the Phase 10/11 transition) routes
     per-channel session methods (``is_active`` / ``send_stream`` /
     ``get_session_id``) to the engine-appropriate backend — TmuxManager for
     claude, CodexSessionManager for codex. When omitted, we fall back to
@@ -668,11 +668,12 @@ async def send_streaming_response(
     )
 
     # Resolve the engine-appropriate backend once for the per-channel session
-    # methods used below. When ``dispatcher`` is not wired in yet (transition),
-    # fall back to ``tmux_manager`` — which is still the claude backend.
+    # methods used below. When ``backend_dispatcher`` is not wired in yet
+    # (transition), fall back to ``tmux_manager`` — which is still the claude
+    # backend.
     backend: SessionBackend | None
-    if dispatcher is not None:
-        backend = _backend_for(dispatcher, topic_config, channel_key)
+    if backend_dispatcher is not None:
+        backend = _backend_for(backend_dispatcher, topic_config, channel_key)
     else:
         backend = tmux_manager
 

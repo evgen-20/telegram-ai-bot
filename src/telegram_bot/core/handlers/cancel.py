@@ -49,7 +49,7 @@ async def handle_cancel_cc(
     queue: MessageQueue,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig | None = None,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Handle cancel button press: interrupt active backend or kill subprocess and clear queue."""
     message = callback.message
@@ -59,7 +59,9 @@ async def handle_cancel_cc(
 
     key = _callback_channel_key(message)
     backend: SessionBackend | TmuxManager = (
-        _backend_for(dispatcher, topic_config, key) if dispatcher is not None else tmux_manager
+        _backend_for(backend_dispatcher, topic_config, key)
+        if backend_dispatcher is not None
+        else tmux_manager
     )
     tmux_acted = backend.is_active(key)
     if tmux_acted:
@@ -90,12 +92,14 @@ async def handle_cancel_text(
     queue: MessageQueue,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig | None = None,
-    dispatcher: BackendDispatcher | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Handle reply-keyboard cancel: interrupt active backend or kill subprocess + clear queue."""
     key = channel_key(message)
     backend: SessionBackend | TmuxManager = (
-        _backend_for(dispatcher, topic_config, key) if dispatcher is not None else tmux_manager
+        _backend_for(backend_dispatcher, topic_config, key)
+        if backend_dispatcher is not None
+        else tmux_manager
     )
     tmux_acted = backend.is_active(key)
     if tmux_acted:
