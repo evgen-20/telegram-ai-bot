@@ -40,6 +40,7 @@ from telegram_bot.core.services.resume_listing import (
     get_last_assistant_message,
     list_sessions,
 )
+from telegram_bot.core.services.session_backend import BackendDispatcher, SessionBackend
 from telegram_bot.core.services.telegram_utils import send_html_with_fallback
 from telegram_bot.core.services.tmux_manager import TmuxManager
 from telegram_bot.core.services.topic_config import (
@@ -73,6 +74,35 @@ def _exec_mode_picker_caption(mode: str) -> str:
 
 
 router = Router(name="commands")
+
+
+def _backend_for(
+    dispatcher: BackendDispatcher,
+    topic_config: TopicConfig | None,
+    channel_key: ChannelKey,
+) -> SessionBackend:
+    """Resolve the engine-appropriate ``SessionBackend`` for *channel_key*."""
+    _, thread_id = channel_key
+    if topic_config is not None and thread_id is not None:
+        engine = topic_config.get_topic(thread_id).engine
+    else:
+        engine = "claude"
+    return dispatcher.for_engine(engine)
+
+
+def _resolve_backend(
+    dispatcher: BackendDispatcher | None,
+    topic_config: TopicConfig | None,
+    channel_key: ChannelKey,
+    tmux_manager: TmuxManager,
+) -> SessionBackend | TmuxManager:
+    """Backend lookup with the historical ``tmux_manager`` fallback for the
+    Phase 10/11 transition window — once ``__main__.py`` wires the
+    dispatcher we'll drop the fallback path.
+    """
+    if dispatcher is None:
+        return tmux_manager
+    return _backend_for(dispatcher, topic_config, channel_key)
 
 
 def _resume_caption(
@@ -151,6 +181,7 @@ async def _reset_channel(
     forward_batcher: ForwardBatcher,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig,
+    dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Unified reset path for /new, /clear, and the "Новый чат" reply button.
 
@@ -159,13 +190,14 @@ async def _reset_channel(
     Otherwise → full subprocess reset + ui.new_session.
     """
     settings = topic_config.get_topic(key[1])
-    if tmux_manager.is_active(key):
+    backend = _resolve_backend(dispatcher, topic_config, key, tmux_manager)
+    if backend.is_active(key):
         # clear_context respawns the tmux session; _spawn_tmux can fail
         # (tmux server shutdown race, readiness timeout, etc.). Without a
         # catch here the RuntimeError reaches aiogram's error middleware
         # and the user sees nothing — "Новый чат" becomes a silent button.
         try:
-            reset_live = await tmux_manager.clear_context(key, session_manager)
+            reset_live = await backend.clear_context(key, session_manager)
         except RuntimeError:
             logger.warning("clear_context failed for %s", key, exc_info=True)
             await message.answer(t("ui.reset_failed"))
@@ -179,13 +211,13 @@ async def _reset_channel(
         logger.info("clear_context found no live tmux for %s; starting fresh", key)
 
     if settings.exec_mode == "tmux":
-        await tmux_manager.kill(key)
+        await backend.kill(key)
         forward_batcher.clear(key)
         await message_queue.clear(key)
         await session_manager.kill_session(key)
         session = session_manager._get_session(key)
         try:
-            await tmux_manager.start_session(
+            await backend.start_session(
                 key,
                 mode=session.mode,
                 cwd=session.cwd,
@@ -218,11 +250,19 @@ async def handle_new(
     forward_batcher: ForwardBatcher,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig,
+    dispatcher: BackendDispatcher | None = None,
 ) -> None:
     key = channel_key(message)
     logger.debug("User %s requested new session", message.from_user and message.from_user.id)
     await _reset_channel(
-        message, key, session_manager, message_queue, forward_batcher, tmux_manager, topic_config
+        message,
+        key,
+        session_manager,
+        message_queue,
+        forward_batcher,
+        tmux_manager,
+        topic_config,
+        dispatcher,
     )
 
 
@@ -234,11 +274,19 @@ async def handle_clear(
     forward_batcher: ForwardBatcher,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig,
+    dispatcher: BackendDispatcher | None = None,
 ) -> None:
     key = channel_key(message)
     logger.debug("User %s requested clear", message.from_user and message.from_user.id)
     await _reset_channel(
-        message, key, session_manager, message_queue, forward_batcher, tmux_manager, topic_config
+        message,
+        key,
+        session_manager,
+        message_queue,
+        forward_batcher,
+        tmux_manager,
+        topic_config,
+        dispatcher,
     )
 
 
@@ -248,11 +296,14 @@ async def handle_cancel_command(
     session_manager: SessionManager,
     message_queue: MessageQueue,
     tmux_manager: TmuxManager,
+    topic_config: TopicConfig | None = None,
+    dispatcher: BackendDispatcher | None = None,
 ) -> None:
     key = channel_key(message)
-    tmux_acted = tmux_manager.is_active(key)
+    backend = _resolve_backend(dispatcher, topic_config, key, tmux_manager)
+    tmux_acted = backend.is_active(key)
     if tmux_acted:
-        await tmux_manager.cancel(key)
+        await backend.cancel(key)
     cancelled = await message_queue.cancel(key)
     if cancelled or tmux_acted:
         logger.debug("User cancelled CC processing (command) for %s", key)
@@ -262,16 +313,22 @@ async def handle_cancel_command(
 
 
 @router.message(Command("kill"))
-async def handle_kill(message: Message, tmux_manager: TmuxManager) -> None:
-    """Kill the tmux session in the current topic."""
+async def handle_kill(
+    message: Message,
+    tmux_manager: TmuxManager,
+    topic_config: TopicConfig | None = None,
+    dispatcher: BackendDispatcher | None = None,
+) -> None:
+    """Kill the active backend session in the current topic."""
     key = channel_key(message)
-    if not tmux_manager.is_active(key):
+    backend = _resolve_backend(dispatcher, topic_config, key, tmux_manager)
+    if not backend.is_active(key):
         await message.answer(t("ui.tmux_not_active"))
         return
     logger.debug(
         "User %s killed tmux session for %s", message.from_user and message.from_user.id, key
     )
-    await tmux_manager.kill(key)
+    await backend.kill(key)
     await message.answer(t("ui.tmux_killed"))
 
 
@@ -283,6 +340,7 @@ async def handle_resume(
     tmux_manager: TmuxManager,
     picker_store: PickerStore,
     bot_defaults: BotDefaults,
+    dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Open server-side picker with resumable Claude/Codex sessions."""
     key = channel_key(message)
@@ -307,7 +365,8 @@ async def handle_resume(
         )
     )
     total_pages = max(1, math.ceil(len(entries) / 8))
-    current_session_id = tmux_manager.get_active_session_id(key)
+    backend = _resolve_backend(dispatcher, topic_config, key, tmux_manager)
+    current_session_id = backend.get_session_id(key)
     await message.answer(
         _resume_caption(
             runtime.cwd,
@@ -390,6 +449,8 @@ async def on_resume_page(
     callback: CallbackQuery,
     picker_store: PickerStore,
     tmux_manager: TmuxManager,
+    topic_config: TopicConfig | None = None,
+    dispatcher: BackendDispatcher | None = None,
 ) -> None:
     if callback.data is None or callback.message is None:
         await callback.answer()
@@ -414,6 +475,9 @@ async def on_resume_page(
         return
     total_pages = max(1, math.ceil(len(state.entries) / 8))
     page = max(0, min(page, total_pages - 1))
+    assert key is not None  # guarded by the (state.chat_id, state.thread_id) check above
+    backend = _resolve_backend(dispatcher, topic_config, key, tmux_manager)
+    current_session_id = backend.get_session_id(key)
     try:
         await callback.message.edit_text(
             _resume_caption(
@@ -421,12 +485,12 @@ async def on_resume_page(
                 page=page,
                 total_pages=total_pages,
                 entries=state.entries,
-                current_session_id=tmux_manager.get_active_session_id(key),
+                current_session_id=current_session_id,
             ),
             reply_markup=resume_keyboard(
                 state.entries,
                 page=page,
-                current_session_id=tmux_manager.get_active_session_id(key),
+                current_session_id=current_session_id,
                 token=token,
             ),
             parse_mode="HTML",
@@ -445,6 +509,7 @@ async def on_resume_pick(
     tmux_manager: TmuxManager,
     picker_store: PickerStore,
     bot_defaults: BotDefaults,
+    dispatcher: BackendDispatcher | None = None,
 ) -> None:
     if callback.data is None or callback.message is None:
         await callback.answer()
@@ -481,7 +546,14 @@ async def on_resume_pick(
         return
 
     await _answer_callback_safely(callback, t("ui.resume_starting"))
-    result = await tmux_manager.switch_or_start_session(
+    # Route ``switch_or_start_session`` to the *target* engine's backend so
+    # picking a codex session lands the user on a codex backend (and vice
+    # versa) — the target engine, not the topic's currently-configured one,
+    # is what actually owns the resumed session.
+    resume_backend: SessionBackend | TmuxManager = (
+        dispatcher.for_engine(entry.provider) if dispatcher is not None else tmux_manager
+    )
+    result = await resume_backend.switch_or_start_session(
         key,
         entry.session_id,
         entry.provider,
@@ -609,6 +681,7 @@ async def on_exec_mode_click(
     topic_config: TopicConfig,
     tmux_manager: TmuxManager,
     message_queue: MessageQueue,
+    dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Apply a new exec_mode for the topic the picker was posted in.
 
@@ -640,6 +713,7 @@ async def on_exec_mode_click(
 
     key = (callback.message.chat.id, thread_id)
     previous_mode = topic_config.get_topic(thread_id).exec_mode
+    backend = _resolve_backend(dispatcher, topic_config, key, tmux_manager)
 
     if new_mode == previous_mode:
         await callback.answer(t("ui.exec_mode_already", mode=_exec_mode_label(new_mode)))
@@ -648,14 +722,14 @@ async def on_exec_mode_click(
     # Busy-check covers both channels: tmux's own processing flag AND the
     # subprocess-path MessageQueue (lock held OR items pending). Either way
     # we refuse the switch without touching tmux state.
-    if tmux_manager.is_processing(key) or message_queue.is_busy(key):
+    if backend.is_processing(key) or message_queue.is_busy(key):
         await callback.answer(t("ui.exec_mode_busy"), show_alert=True)
         return
 
     # tmux→subprocess: kill first, then persist. Reverse order leaves an
     # orphan tmux session if the write fails.
     if previous_mode == "tmux" and new_mode == "subprocess":
-        await tmux_manager.kill(key)
+        await backend.kill(key)
 
     ok = await topic_config.update_exec_mode(thread_id, new_mode)
     if not ok:
@@ -708,6 +782,7 @@ async def on_engine_click(
     tmux_manager: TmuxManager,
     message_queue: MessageQueue,
     session_manager: SessionManager,
+    dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Apply provider engine changes for the picker topic."""
     if callback.data is None or callback.message is None:
@@ -724,8 +799,12 @@ async def on_engine_click(
         return
     key = (callback.message.chat.id, thread_id)
     current = topic_config.get_topic(thread_id)
+    # Resolve the backend *before* updating topic_config: ``is_processing``
+    # and the eventual ``kill`` must target the engine that currently owns
+    # this channel's state, not the new one we're about to write in.
+    previous_backend = _resolve_backend(dispatcher, topic_config, key, tmux_manager)
 
-    if tmux_manager.is_processing(key) or message_queue.is_busy(key):
+    if previous_backend.is_processing(key) or message_queue.is_busy(key):
         await callback.answer(t("ui.exec_mode_busy"), show_alert=True)
         return
 
@@ -743,8 +822,8 @@ async def on_engine_click(
         await callback.answer(t("ui.engine_write_failed"), show_alert=True)
         return
 
-    if tmux_manager.is_active(key):
-        await tmux_manager.kill(key)
+    if previous_backend.is_active(key):
+        await previous_backend.kill(key)
     await session_manager.clear_provider_session(key)
 
     logger.info(
