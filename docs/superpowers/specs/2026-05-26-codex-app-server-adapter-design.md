@@ -43,6 +43,19 @@ is broken.
 - Realtime audio events (`thread/realtime/*`).
 - Backward compatibility with Codex < 0.133 (legacy file-rollout path is
   deleted, not gated).
+- **Inbound files for codex topics** (photo / forward / voice uploads).
+  Photo, forward, and voice handlers currently route file-uploads through
+  `tmux_manager.start_session` (or call it directly outside of the
+  dispatcher path), which raises
+  `TmuxManager no longer manages codex sessions; use CodexSessionManager
+  instead` for any codex topic. Surfaces to the user as
+  «❌ Failed to start tmux: …». Out of scope here; follow-up needs:
+    1. Make `photo.py` / `forward.py` / `voice.py` route file upload
+       lifecycle through `BackendDispatcher` like text already does.
+    2. Implement codex-side file ingest (likely an attachment param to
+       `turn/start`, or pre-uploading via `fs/writeFile` RPC).
+    3. Replace the «Failed to start tmux» wording with a codex-aware
+       message when the failure comes from the codex path.
 
 ## 4. Architecture
 
