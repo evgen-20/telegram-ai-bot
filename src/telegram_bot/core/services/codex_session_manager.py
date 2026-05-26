@@ -165,38 +165,9 @@ class CodexSessionManager:
                 with contextlib.suppress(Exception):
                     await existing.client.close()
 
-            notif_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-
-            async def on_notification(notif: dict[str, Any]) -> None:
-                await notif_queue.put(notif)
-
-            client = self._client_factory(
-                command=self._proxy_command_factory(),
-                on_notification=on_notification,
+            client, notif_queue, thread_id = await self._spawn_and_initialize_client(
+                cwd=cwd, model=model, resume_thread_id=resume_session_id
             )
-            await client.__aenter__()
-            try:
-                await client.initialize(client_name="telegram-ai-agent", client_version="1.0")
-
-                if resume_session_id is not None:
-                    try:
-                        await client.thread_resume(thread_id=resume_session_id)
-                        thread_id = resume_session_id
-                    except Exception:
-                        logger.warning(
-                            "thread_resume failed for %s; starting fresh",
-                            resume_session_id,
-                            exc_info=True,
-                        )
-                        ts = await client.thread_start(cwd=cwd, model=model)
-                        thread_id = ts["threadId"]
-                else:
-                    ts = await client.thread_start(cwd=cwd, model=model)
-                    thread_id = ts["threadId"]
-            except Exception:
-                with contextlib.suppress(Exception):
-                    await client.close()
-                raise
 
             state = CodexSessionState(
                 channel_key=channel_key,
@@ -220,14 +191,26 @@ class CodexSessionManager:
         if state is None:
             raise KeyError(f"no codex session for channel {channel_key!r}")
         if state.client is None:
-            raise RuntimeError(
-                f"codex session for {channel_key!r} was restored from disk; "
-                "lazy reconnect is not implemented in this task (see Task 7.3)"
-            )
+            # State was restored from disk (see restore_all). Reconnect now:
+            # ensure the daemon is up, spawn a fresh proxy client, and resume
+            # the persisted thread before driving the turn.
+            await self._daemon.ensure_running()
+            async with self._get_channel_lock(channel_key):
+                # Re-check under lock to avoid double-spawn from concurrent sends.
+                if state.client is None:
+                    client, notif_queue, _ = await self._spawn_and_initialize_client(
+                        cwd=state.cwd,
+                        model=state.model,
+                        resume_thread_id=state.thread_id,
+                    )
+                    state.client = client
+                    state.notif_queue = notif_queue
+                    state.is_active = True
 
         state.is_processing = True
         notif_queue = state.notif_queue
         client = state.client
+        assert client is not None  # narrow for mypy; populated just above
         thread_id = state.thread_id
         try:
             await client.turn_start(thread_id=thread_id, prompt=prompt)
@@ -468,3 +451,54 @@ class CodexSessionManager:
             lock = asyncio.Lock()
             self._channel_locks[channel_key] = lock
         return lock
+
+    async def _spawn_and_initialize_client(
+        self,
+        *,
+        cwd: str,
+        model: str | None,
+        resume_thread_id: str | None,
+    ) -> tuple[CodexAppServerClient, asyncio.Queue[dict[str, Any]], str]:
+        """Spawn a proxy client, initialize it, and start/resume a thread.
+
+        Shared by ``start_session`` (fresh spawn) and ``send_stream`` lazy
+        reconnect (after ``restore_all`` from disk). Returns the live client,
+        its notification queue, and the active ``thread_id``.
+
+        If ``resume_thread_id`` is provided but ``thread/resume`` fails, falls
+        back to a fresh ``thread/start`` and returns the new id.
+        """
+        notif_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        async def on_notification(notif: dict[str, Any]) -> None:
+            await notif_queue.put(notif)
+
+        client = self._client_factory(
+            command=self._proxy_command_factory(),
+            on_notification=on_notification,
+        )
+        await client.__aenter__()
+        try:
+            await client.initialize(client_name="telegram-ai-agent", client_version="1.0")
+
+            if resume_thread_id is not None:
+                try:
+                    await client.thread_resume(thread_id=resume_thread_id)
+                    thread_id = resume_thread_id
+                except Exception:
+                    logger.warning(
+                        "thread_resume failed for %s; starting fresh",
+                        resume_thread_id,
+                        exc_info=True,
+                    )
+                    ts = await client.thread_start(cwd=cwd, model=model)
+                    thread_id = ts["threadId"]
+            else:
+                ts = await client.thread_start(cwd=cwd, model=model)
+                thread_id = ts["threadId"]
+        except Exception:
+            with contextlib.suppress(Exception):
+                await client.close()
+            raise
+
+        return client, notif_queue, thread_id
