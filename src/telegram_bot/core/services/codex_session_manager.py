@@ -32,6 +32,7 @@ from telegram_bot.core.services.codex_app_server import CodexAppServerClient
 from telegram_bot.core.services.codex_daemon import CodexDaemonManager
 from telegram_bot.core.services.codex_events import parse_codex_notification
 from telegram_bot.core.services.tmux_manager import SwitchResult
+from telegram_bot.core.services.tmux_state import load_codex_sessions
 from telegram_bot.core.services.topic_config import Engine, TopicConfig
 from telegram_bot.core.services.topic_runtime import BotDefaults
 from telegram_bot.core.types import ChannelKey
@@ -409,34 +410,12 @@ class CodexSessionManager:
 
     def restore_all(self) -> None:
         """Load persisted codex sessions; client is lazily reconnected later."""
-        try:
-            data = json.loads(self._state_path.read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
-            return
-        if not isinstance(data, dict):
-            return
-        sessions = data.get("codex_sessions")
-        if not isinstance(sessions, dict):
-            return
-        for key_str, info in sessions.items():
-            if not isinstance(key_str, str) or not isinstance(info, dict):
-                continue
-            try:
-                chat_s, thread_s = key_str.split(":", 1)
-                chat = int(chat_s)
-                thread: int | None = None if thread_s == "None" else int(thread_s)
-            except ValueError:
-                logger.warning("skipping malformed codex channel key %r", key_str)
-                continue
-            thread_id = info.get("thread_id")
-            cwd = info.get("cwd")
-            if not isinstance(thread_id, str) or not isinstance(cwd, str):
-                continue
-            channel: ChannelKey = (chat, thread)
+        records = load_codex_sessions(self._state_path)
+        for channel, record in records.items():
             state = CodexSessionState(
                 channel_key=channel,
-                thread_id=thread_id,
-                cwd=cwd,
+                thread_id=record.thread_id,
+                cwd=record.cwd,
                 model=None,
                 client=None,
             )
