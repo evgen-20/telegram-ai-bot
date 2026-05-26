@@ -7,6 +7,7 @@ import collections
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
@@ -21,11 +22,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class QueueItem:
-    """One item in the message queue — may contain multiple batched prompts."""
+    """One item in the message queue — may contain multiple batched prompts.
+
+    ``attachments`` is the union of image paths across batched entries —
+    forwarded to ``backend.send_stream`` for codex topics (``localImage``
+    UserInput). Empty for non-photo prompts. Documents are out of scope
+    (codex has no UserInput variant for non-image files; the claude path
+    handles them via prompt text already).
+    """
 
     entries: list[tuple[int, str]]  # (message_id, prompt)
     source_messages: list[Message]
     target_session_id: str | None = None
+    attachments: list[Path] = field(default_factory=list)
 
 
 @dataclass
@@ -39,7 +48,7 @@ class ChatQueue:
 
 # Type alias for the process callback
 ProcessCallback = Callable[
-    [ChannelKey, str, list[Message], str | None],
+    [ChannelKey, str, list[Message], str | None, list[Path]],
     Awaitable[None],
 ]
 
@@ -102,13 +111,20 @@ class MessageQueue:
         source_message: Message,
         target_session_id: str | None = None,
         suppress_notification: bool = False,
+        attachments: list[Path] | None = None,
     ) -> None:
         """Add a message to the channel's queue.
 
         Synchronous — no await between state check and mutation to prevent races.
         suppress_notification=True skips the "added to queue" Telegram message.
         Use this when the caller already provides meaningful feedback (e.g. tmux mode).
+
+        ``attachments`` carries image paths forward through the queue so codex
+        topics can hand them to ``turn/start`` as ``localImage`` UserInput
+        entries. When batching into an existing item, attachments are
+        concatenated so both prompts' images reach the backend in one turn.
         """
+        attachments = list(attachments) if attachments else []
         queue = self._get_queue(channel_key)
 
         if not queue.lock.locked():
@@ -117,6 +133,7 @@ class MessageQueue:
                 entries=[(message_id, prompt)],
                 source_messages=[source_message],
                 target_session_id=target_session_id,
+                attachments=attachments,
             )
             queue.items.append(item)
             logger.info(
@@ -139,6 +156,7 @@ class MessageQueue:
             if item.target_session_id == target_key:
                 item.entries.append((message_id, prompt))
                 item.source_messages.append(source_message)
+                item.attachments.extend(attachments)
                 batched = True
                 # Find position of this item in queue (1-based)
                 position = list(queue.items).index(item) + 1
@@ -156,6 +174,7 @@ class MessageQueue:
                 entries=[(message_id, prompt)],
                 source_messages=[source_message],
                 target_session_id=target_session_id,
+                attachments=attachments,
             )
             queue.items.append(item)
             position = len(queue.items)
@@ -252,6 +271,7 @@ class MessageQueue:
                         combined_prompt,
                         item.source_messages,
                         item.target_session_id,
+                        item.attachments,
                     )
                     queue.error_count = 0
                 except Exception:

@@ -66,7 +66,9 @@ class _FakeClient:
     async def thread_resume(self, *, thread_id: str) -> None:
         return None
 
-    async def turn_start(self, *, thread_id: str, prompt: str) -> None:
+    async def turn_start(
+        self, *, thread_id: str, prompt: str, attachments: list[str] | None = None
+    ) -> None:
         self.last_prompt = prompt
         # Script: agentMessage delta -> agentMessage completed (final) -> turn/completed.
         await self._emit(
@@ -107,6 +109,108 @@ class _FakeClient:
         ret = self._on_notification(notif)
         if hasattr(ret, "__await__"):
             await ret  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_send_stream_forwards_attachments_as_local_image(
+    daemon_mock: AsyncMock, tmp_path: Path
+) -> None:
+    """Photo paths surface as ``localImage`` UserInput entries on ``turn/start``."""
+
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}")
+    mgr = CodexSessionManager(
+        daemon=daemon_mock,
+        state_path=state_path,
+        proxy_command_factory=lambda: ["bash", "-c", "cat"],
+    )
+
+    turn_start_calls: list[dict[str, Any]] = []
+
+    class AttachmentFakeClient:
+        thread_id = "th-attach"
+
+        def __init__(
+            self,
+            *,
+            command: list[str],
+            on_notification: Callable[[dict[str, Any]], Awaitable[None] | None],
+        ) -> None:
+            self._on_notification = on_notification
+
+        async def __aenter__(self) -> AttachmentFakeClient:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def initialize(self, *, client_name: str, client_version: str) -> dict[str, Any]:
+            return {"serverInfo": {}}
+
+        async def thread_start(self, *, cwd: str, model: str | None) -> dict[str, Any]:
+            return {"threadId": self.thread_id}
+
+        async def turn_start(
+            self,
+            *,
+            thread_id: str,
+            prompt: str,
+            attachments: list[str] | None = None,
+        ) -> None:
+            turn_start_calls.append(
+                {"thread_id": thread_id, "prompt": prompt, "attachments": attachments}
+            )
+            await self._emit(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": "t1",
+                        "status": "completed",
+                    },
+                }
+            )
+
+        async def turn_interrupt(self, *, thread_id: str, turn_id: str) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def _emit(self, notif: dict[str, Any]) -> None:
+            ret = self._on_notification(notif)
+            if hasattr(ret, "__await__"):
+                await ret  # type: ignore[misc]
+
+    mgr._client_factory = AttachmentFakeClient  # type: ignore[assignment]
+
+    ch = (-1002, 17)
+    await mgr.start_session(
+        ch,
+        mode="free",
+        cwd="/tmp",
+        mcp_config="",
+        chat_id=ch[0],
+        session_manager=object(),
+        resume_session_id=None,
+        provider="codex",
+        model=None,
+    )
+
+    img_a = tmp_path / "a.jpg"
+    img_a.write_bytes(b"\xff\xd8\xff")
+    img_b = tmp_path / "b.jpg"
+    img_b.write_bytes(b"\xff\xd8\xff")
+
+    async def _noop(_ev: StreamEvent) -> None:
+        return None
+
+    await mgr.send_stream(ch, "describe these", _noop, attachments=[img_a, img_b])
+
+    assert len(turn_start_calls) == 1
+    call = turn_start_calls[0]
+    assert call["prompt"] == "describe these"
+    assert call["attachments"] == [str(img_a), str(img_b)]
 
 
 @pytest.mark.asyncio
@@ -202,7 +306,9 @@ async def test_send_stream_emits_image_message(daemon_mock: AsyncMock, tmp_path:
         async def thread_start(self, *, cwd: str, model: str | None) -> dict[str, Any]:
             return {"threadId": "t"}
 
-        async def turn_start(self, *, thread_id: str, prompt: str) -> None:
+        async def turn_start(
+            self, *, thread_id: str, prompt: str, attachments: list[str] | None = None
+        ) -> None:
             await self._emit(
                 {
                     "method": "item/completed",
@@ -292,7 +398,9 @@ async def test_cancel_invokes_turn_interrupt(daemon_mock: AsyncMock, tmp_path: P
         async def thread_start(self, *, cwd: str, model: str | None) -> dict[str, Any]:
             return {"threadId": self.thread_id}
 
-        async def turn_start(self, *, thread_id: str, prompt: str) -> None:
+        async def turn_start(
+            self, *, thread_id: str, prompt: str, attachments: list[str] | None = None
+        ) -> None:
             # Emit only turn/started so the manager records current_turn_id;
             # do NOT emit turn/completed — cancel will be triggered externally.
             await self._emit(
@@ -398,7 +506,9 @@ async def test_clear_context_replaces_thread_id(daemon_mock: AsyncMock, tmp_path
         async def thread_resume(self, *, thread_id: str) -> None:
             return None
 
-        async def turn_start(self, *, thread_id: str, prompt: str) -> None:
+        async def turn_start(
+            self, *, thread_id: str, prompt: str, attachments: list[str] | None = None
+        ) -> None:
             return None
 
         async def turn_interrupt(self, *, thread_id: str, turn_id: str) -> None:
@@ -491,7 +601,9 @@ async def test_restore_all_then_send_stream_lazy_reconnect(
         async def thread_resume(self, *, thread_id: str) -> None:
             resume_calls.append(thread_id)
 
-        async def turn_start(self, *, thread_id: str, prompt: str) -> None:
+        async def turn_start(
+            self, *, thread_id: str, prompt: str, attachments: list[str] | None = None
+        ) -> None:
             # Drive a minimal happy turn to completion.
             await self._emit(
                 {

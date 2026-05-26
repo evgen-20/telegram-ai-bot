@@ -24,6 +24,7 @@ create a cycle.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from aiogram.types import Message
 
@@ -67,6 +68,7 @@ def enqueue_prompt(
     inject_reply_if_no_target: bool,
     backend_dispatcher: BackendDispatcher | None = None,
     topic_config: TopicConfig | None = None,
+    attachments: list[Path] | None = None,
 ) -> None:
     """Final enqueue step shared by text/voice/photo/forward handlers.
 
@@ -107,4 +109,5 @@ def enqueue_prompt(
         source_msg,
         target_session_id=target_session_id,
         suppress_notification=backend.is_active(key),
+        attachments=attachments,
     )

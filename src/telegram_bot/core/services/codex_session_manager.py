@@ -217,8 +217,16 @@ class CodexSessionManager:
         channel_key: ChannelKey,
         prompt: str,
         on_event: Callable[[StreamEvent], Awaitable[None] | None],
+        *,
+        attachments: list[Path] | None = None,
     ) -> str:
-        """Drive one ``turn/start`` and stream notifications until completion."""
+        """Drive one ``turn/start`` and stream notifications until completion.
+
+        ``attachments`` is forwarded to codex as ``localImage`` UserInput
+        entries — codex reads each path from disk and feeds it to its
+        vision-capable model. Currently only image paths are supported (no
+        UserInput variant exists for generic files); callers must filter.
+        """
         state = self._sessions.get(channel_key)
         if state is None:
             raise KeyError(f"no codex session for channel {channel_key!r}")
@@ -245,7 +253,12 @@ class CodexSessionManager:
         assert client is not None  # narrow for mypy; populated just above
         thread_id = state.thread_id
         try:
-            await client.turn_start(thread_id=thread_id, prompt=prompt)
+            attachment_paths = [str(p) for p in attachments] if attachments else None
+            await client.turn_start(
+                thread_id=thread_id,
+                prompt=prompt,
+                attachments=attachment_paths,
+            )
             while True:
                 try:
                     notif = await asyncio.wait_for(notif_queue.get(), timeout=_TURN_TIMEOUT_SEC)

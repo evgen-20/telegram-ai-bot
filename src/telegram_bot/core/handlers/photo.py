@@ -22,6 +22,7 @@ from telegram_bot.core.handlers.streaming import (
 from telegram_bot.core.messages import t
 from telegram_bot.core.services.claude import SessionManager
 from telegram_bot.core.services.message_queue import MessageQueue
+from telegram_bot.core.services.session_backend import BackendDispatcher
 from telegram_bot.core.services.tmux_manager import TmuxManager
 from telegram_bot.core.services.topic_config import TopicConfig
 from telegram_bot.core.types import ChannelKey, channel_key
@@ -230,6 +231,7 @@ def _make_media_callback(
     message_queue: MessageQueue,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> Callable[[list[Message]], Awaitable[None]]:
     """Create the on_media_batch callback shared by photo and document handlers."""
 
@@ -247,7 +249,12 @@ def _make_media_callback(
             return
 
         if not await ensure_exec_mode_ready(
-            key, topic_config, tmux_manager, session_manager, last_msg
+            key,
+            topic_config,
+            tmux_manager,
+            session_manager,
+            last_msg,
+            backend_dispatcher,
         ):
             return
 
@@ -271,8 +278,20 @@ def _make_media_callback(
 
         prompt = _format_media_prompt(items, comment if comment else None)
 
+        # Codex consumes images via the `localImage` UserInput, not the prompt
+        # body. Collect successfully-downloaded photo paths so the backend can
+        # attach them to `turn/start`. Documents and failed downloads are
+        # excluded — codex has no UserInput variant for non-image files, and
+        # the claude path picks images out of the prompt text on its own
+        # (the `attachments` kwarg is accepted but ignored there for symmetry).
+        attachments: list[Path] = [
+            Path(item["path"])
+            for item in items
+            if item.get("type") == "photo" and item.get("path") is not None
+        ]
+
         # Tmux with active tail: send directly to CC stdin, bypass queue.
-        if await send_to_tmux_if_active(key, prompt, last_msg, tmux_manager):
+        if await send_to_tmux_if_active(key, prompt, last_msg, tmux_manager, backend_dispatcher):
             return
 
         if text_reply:
@@ -291,6 +310,9 @@ def _make_media_callback(
             tmux_manager,
             target_session_id=target_session_id,
             inject_reply_if_no_target=True,
+            backend_dispatcher=backend_dispatcher,
+            topic_config=topic_config,
+            attachments=attachments,
         )
 
     return on_media_batch
@@ -305,6 +327,7 @@ async def handle_photo(
     message_queue: MessageQueue,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Handle photo messages: validate size, add to media batcher."""
     key = channel_key(message)
@@ -327,6 +350,7 @@ async def handle_photo(
         message_queue,
         tmux_manager,
         topic_config,
+        backend_dispatcher,
     )
     forward_batcher.add_media(key, message, callback)
 
@@ -340,6 +364,7 @@ async def handle_document(
     message_queue: MessageQueue,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Handle document messages: validate size, add to media batcher."""
     key = channel_key(message)
@@ -362,5 +387,6 @@ async def handle_document(
         message_queue,
         tmux_manager,
         topic_config,
+        backend_dispatcher,
     )
     forward_batcher.add_media(key, message, callback)

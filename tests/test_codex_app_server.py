@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -133,6 +134,72 @@ async def test_auto_approve_exec_command_approval() -> None:
 
 async def _no_notify(n: dict[str, Any]) -> None:
     pass
+
+
+@pytest.mark.asyncio
+async def test_turn_start_builds_input_array_with_local_image_attachments() -> None:
+    """``turn_start`` includes one ``localImage`` UserInput entry per attachment."""
+
+    captured: list[dict[str, Any]] = []
+
+    client = CodexAppServerClient(
+        command=["bash", "-c", "exec cat > /dev/null"],
+        on_notification=_no_notify,
+    )
+
+    async def _capture(msg: dict[str, Any]) -> None:
+        captured.append(msg)
+
+    # Bypass the JSON-RPC round trip — we only care about the request shape.
+    # ``_request`` normally awaits a response future, but the stub subprocess
+    # never replies, so we patch it to capture-and-return.
+    async def _fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        captured.append({"method": method, "params": params})
+        return {}
+
+    client._request = _fake_request  # type: ignore[assignment]
+
+    await client.turn_start(
+        thread_id="thr-1",
+        prompt="describe these",
+        attachments=["/tmp/one.jpg", "/tmp/two.jpg"],
+    )
+
+    assert len(captured) == 1
+    sent = captured[0]
+    assert sent["method"] == "turn/start"
+    params = sent["params"]
+    assert params["threadId"] == "thr-1"
+    assert params["input"] == [
+        {"type": "text", "text": "describe these"},
+        {"type": "localImage", "path": "/tmp/one.jpg", "detail": None},
+        {"type": "localImage", "path": "/tmp/two.jpg", "detail": None},
+    ]
+    # Round-trip through json to make sure the payload is JSON-encodable
+    # (None becomes null, matching the schema's default for ``detail``).
+    assert "null" in json.dumps(params["input"][1])
+
+
+@pytest.mark.asyncio
+async def test_turn_start_without_attachments_omits_local_image_entries() -> None:
+    """Default (no attachments) keeps the prior text-only ``input`` shape."""
+
+    captured: list[dict[str, Any]] = []
+
+    client = CodexAppServerClient(
+        command=["bash", "-c", "exec cat > /dev/null"],
+        on_notification=_no_notify,
+    )
+
+    async def _fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        captured.append({"method": method, "params": params})
+        return {}
+
+    client._request = _fake_request  # type: ignore[assignment]
+
+    await client.turn_start(thread_id="thr-2", prompt="hello")
+
+    assert captured[0]["params"]["input"] == [{"type": "text", "text": "hello"}]
 
 
 @pytest.mark.asyncio

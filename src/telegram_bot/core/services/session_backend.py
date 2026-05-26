@@ -57,6 +57,8 @@ class SessionBackend(Protocol):
         channel_key: ChannelKey,
         prompt: str,
         on_event: Callable[[StreamEvent], Awaitable[None] | None],
+        *,
+        attachments: list[Path] | None = None,
     ) -> str: ...
 
     async def send_direct(self, channel_key: ChannelKey, prompt: str) -> bool: ...

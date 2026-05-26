@@ -107,17 +107,33 @@ class CodexAppServerClient:
     async def thread_resume(self, *, thread_id: str) -> None:
         await self._request("thread/resume", {"threadId": thread_id})
 
-    async def turn_start(self, *, thread_id: str, prompt: str) -> None:
+    async def turn_start(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        attachments: list[str] | None = None,
+    ) -> None:
         # Fire-and-forget: response is delivered via notifications. The
         # ``input`` shape is an array of ``UserInput`` items (see
         # ``docs/codex-protocol/schemas/v2/TurnStartParams.json``). The plan
         # used a flat ``prompt`` string, which the server now rejects with
         # "missing field `input`".
+        #
+        # When ``attachments`` is non-empty, append one ``localImage``
+        # UserInput per absolute path. Codex reads each file from disk and
+        # forwards it to its vision-capable model — see the ``LocalImageUserInput``
+        # variant of UserInput in the schema. Non-image attachments are out
+        # of scope here (no UserInput variant matches a generic file blob).
+        inputs: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        if attachments:
+            for path in attachments:
+                inputs.append({"type": "localImage", "path": path, "detail": None})
         await self._request(
             "turn/start",
             {
                 "threadId": thread_id,
-                "input": [{"type": "text", "text": prompt}],
+                "input": inputs,
             },
         )
 

@@ -1672,6 +1672,8 @@ class TmuxManager:
         channel_key: ChannelKey,
         prompt: str,
         on_event: Callable[[StreamEvent], Awaitable[None] | None],
+        *,
+        attachments: list[Path] | None = None,
     ) -> str:
         """Send user message to persistent CC TUI and tail transcript until done.
 
@@ -1683,7 +1685,15 @@ class TmuxManager:
         modal-blocked session no longer blind-Enters on a dialog. On
         False, the tail is never started (CC would not emit a result
         event) and the finally block cleans up flags.
+
+        ``attachments`` is accepted for SessionBackend Protocol compatibility
+        but ignored: the tmux/claude backend already handles images via the
+        prompt text ("[Photo]\\nFile: /abs/path.jpg" lines from photo.py) which
+        the Claude CLI picks up from disk. Codex needs the explicit
+        ``localImage`` UserInput, which is why the kwarg exists on the
+        Protocol.
         """
+        del attachments  # see docstring
         cancel_event = asyncio.Event()
         state: TmuxSessionState | None = None
         output_path: Path | None = None

@@ -45,6 +45,7 @@ async def process_queue_item(
     prompt: str,
     source_messages: list[Message],
     target_session_id: str | None,
+    attachments: list[Path],
     *,
     bot: Bot,
     session_manager: SessionManager,
@@ -91,6 +92,7 @@ async def process_queue_item(
         tmux_manager=tmux_manager,
         topic_config=topic_config,
         backend_dispatcher=backend_dispatcher,
+        attachments=attachments,
     )
 
 
@@ -134,12 +136,14 @@ async def _start() -> None:
         prompt: str,
         source_messages: list[Message],
         target_session_id: str | None,
+        attachments: list[Path],
     ) -> None:
         await process_queue_item(
             channel_key,
             prompt,
             source_messages,
             target_session_id,
+            attachments,
             bot=bot,
             session_manager=session_manager,
             tmux_manager=tmux_manager,

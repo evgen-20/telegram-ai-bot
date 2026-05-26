@@ -632,6 +632,7 @@ async def send_streaming_response(
     tmux_manager: TmuxManager | None = None,
     topic_config: TopicConfig | None = None,
     backend_dispatcher: BackendDispatcher | None = None,
+    attachments: list[Path] | None = None,
 ) -> None:
     """Send prompt to CC with streaming and deliver response to user.
 
@@ -835,7 +836,9 @@ async def send_streaming_response(
     try:
         if used_tmux:
             assert backend is not None
-            response = await backend.send_stream(channel_key, prompt, on_event)
+            response = await backend.send_stream(
+                channel_key, prompt, on_event, attachments=attachments
+            )
             # Sync session_id back so reply-to-resume works
             new_sid = backend.get_session_id(channel_key)
             if new_sid:
@@ -846,6 +849,7 @@ async def send_streaming_response(
                 prompt,
                 on_event,
                 on_engine_changed=_notify_engine_changed,
+                attachments=attachments,
             )
     except asyncio.CancelledError:
         # Status messages ARE the history — no cleanup needed

@@ -902,6 +902,7 @@ class SessionManager:
         on_event: Callable[[StreamEvent], Awaitable[None] | None],
         *,
         on_engine_changed: Callable[[str], Awaitable[None]] | None = None,
+        attachments: list[Path] | None = None,
     ) -> str:
         """Send a prompt to CC with streaming events. Returns final response text.
 
@@ -910,7 +911,12 @@ class SessionManager:
         responsible for surfacing this to the user — same wording as a manual
         /engine switch — so the conversation does not silently move to a new
         provider mid-flight.
+
+        ``attachments`` is accepted for parity with the codex backend but
+        unused: the Claude CLI already reads image files referenced in the
+        prompt body (photo.py renders ``File: /abs/path.jpg`` lines).
         """
+        del attachments  # see docstring
         session = self._get_session(channel_key)
 
         async with session.lock:
