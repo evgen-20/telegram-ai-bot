@@ -8,11 +8,13 @@ import html
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from aiogram import Bot
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import Message
+from aiogram.types import FSInputFile, Message
 from aiogram.utils.text_decorations import HtmlDecoration
 
 from telegram_bot.core.keyboards import topic_keyboard
@@ -39,6 +41,7 @@ __all__ = [
     "_markdown_to_html_parts",
     "_smart_escape",
     "build_reply_context",
+    "dispatch_image_event",
     "ensure_exec_mode_ready",
     "inject_reply_context",
     "markdown_to_html",
@@ -48,6 +51,39 @@ __all__ = [
     "send_to_tmux_if_active",
     "split_html_message",
 ]
+
+
+_MAX_PHOTO_BYTES = 10 * 1024 * 1024
+
+
+async def dispatch_image_event(
+    *,
+    bot: Bot,
+    chat_id: int,
+    thread_id: int | None,
+    event: StreamEvent,
+) -> None:
+    """Send an image_message StreamEvent as a Telegram photo (or document fallback)."""
+    path = Path(event.content)
+    if not path.exists():
+        return
+    caption = event.session_id  # repurposed field for image_message
+    size = path.stat().st_size
+    if size <= _MAX_PHOTO_BYTES:
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=FSInputFile(str(path)),
+            caption=caption,
+            message_thread_id=thread_id,
+        )
+        return
+    await bot.send_document(
+        chat_id=chat_id,
+        document=FSInputFile(str(path)),
+        caption=caption,
+        message_thread_id=thread_id,
+    )
+
 
 # Default when topic_config is not wired in (standalone / legacy tests).
 # "verbose" preserves pre-Wave-2 behavior: every status becomes its own message.
@@ -679,6 +715,21 @@ async def send_streaming_response(
         # Per-mode handlers receive only non-empty events.
         if event.type in ("status", "text", "result_message") and not event.content.strip():
             logger.debug("Dropping empty %s event on channel %s", event.type, ctx.channel_key)
+            return
+
+        # image_message events bypass stream-mode routing — they're media,
+        # not text, so they're delivered identically in verbose/live/minimal.
+        if event.type == "image_message":
+            if message.bot is not None:
+                try:
+                    await dispatch_image_event(
+                        bot=message.bot,
+                        chat_id=message.chat.id,
+                        thread_id=channel_key[1],
+                        event=event,
+                    )
+                except TelegramAPIError:
+                    logger.exception("Failed to deliver image_message on channel %s", channel_key)
             return
 
         # Mode-specific early drops / routing done before dispatch so the
