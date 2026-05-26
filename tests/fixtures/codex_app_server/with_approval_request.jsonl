@@ -1,0 +1,4 @@
+{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"codex","version":"0.133.0"},"capabilities":{}}}
+{"jsonrpc":"2.0","id":2,"result":{"threadId":"th-1"}}
+{"jsonrpc":"2.0","id":100,"method":"execCommandApproval","params":{"threadId":"th-1","requestId":"r1","summary":"rm -rf /tmp/x"}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th-1","turnId":"t1","status":"completed"}}
