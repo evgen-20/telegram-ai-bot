@@ -27,6 +27,10 @@ is broken.
   command status messages, final answer, restart survival.
 - Use Codex's documented integration surface (app-server JSON-RPC), not its
   internal SQLite schema.
+- Surface Codex's native image generation (a first-class
+  `ImageGenerationThreadItem` in the protocol, included in ChatGPT subscription
+  — no MCP or third-party API needed) by auto-delivering the saved file to the
+  Telegram chat as a photo.
 - Land cleanly in the fork, ready for an upstream PR.
 
 ## 3. Non-goals (v1)
@@ -180,6 +184,9 @@ unchanged.
 | `item/completed` (kind=fileChange, success) | nothing (success implied; success-on-end suppression matches Bash behaviour) |
 | `item/started` (kind=mcpToolCall) | `("status", "MCP: <tool>")` |
 | `item/completed` (kind=mcpToolCall, error) | `("status", "MCP: <tool> failed: <err>")` |
+| `item/started` (kind=imageGeneration) | `("status", "Generating image...")` |
+| `item/completed` (kind=imageGeneration, success) | `("image_message", savedPath, revisedPrompt)` — bot sends photo via `sendPhoto` (fallback `sendDocument` if >10 MB) |
+| `item/completed` (kind=imageGeneration, error) | `("status", "Image generation failed: <err>")` |
 | `turn/completed` | `("result", "")` — done sentinel |
 | `*Approval` (server→client RPC) | auto-reply `approve`; no event |
 | `thread/tokenUsage/updated` | stash on session state (for `/status`); no event |
@@ -283,10 +290,12 @@ Types: `mypy --strict` clean. Ruff clean.
 2. Verify daemon healthy (or start it).
 3. Drive the bot's `CodexSessionManager` directly (no Telegram I/O) against a
    sandbox cwd: `tests/smoke-fixtures/codex-cwd/`.
-4. Run 3 turns: greeting; "create hello.py and run it"; "what did it print?".
-   Per-turn timeout: 5 minutes (force `turn/interrupt` and fail on overrun).
+4. Run 4 turns: greeting; "create hello.py and run it"; "what did it print?";
+   "generate a 16:9 image of a cat coding". Per-turn timeout: 5 minutes
+   (force `turn/interrupt` and fail on overrun).
 5. Assert: final messages received; status events for Bash + Write appeared;
-   `hello.py` exists on disk; cleanup.
+   `hello.py` exists on disk; an `ImageGenerationThreadItem` event arrived
+   with `savedPath` pointing to an existing file ≥5 KB; cleanup.
 
 Run manually before merging to fork `main`. Not in CI (needs auth + API
 spend).
@@ -331,6 +340,9 @@ deployment.
 - Smoke script passes happy path + 2 edge cases.
 - Manual check in topic `solid-tech codex` (#3364): message → typing-stream
   reply + visible Bash status events.
+- Manual check in same topic: "сгенерь картинку X" → photo appears in chat as
+  a Telegram photo (not as a document), with no OpenRouter / MCP setup
+  required (relies solely on Codex's ChatGPT-account image-gen capability).
 - The original `RuntimeError: Codex TUI transcript discovery failed` no
   longer reproduces.
 - After `systemctl restart`, the next message in `#3364` continues the same
