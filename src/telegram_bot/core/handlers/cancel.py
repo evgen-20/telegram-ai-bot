@@ -9,7 +9,9 @@ from aiogram.types import CallbackQuery, InaccessibleMessage, Message
 
 from telegram_bot.core.messages import t
 from telegram_bot.core.services.message_queue import MessageQueue
+from telegram_bot.core.services.session_backend import BackendDispatcher, SessionBackend
 from telegram_bot.core.services.tmux_manager import TmuxManager
+from telegram_bot.core.services.topic_config import TopicConfig
 from telegram_bot.core.types import ChannelKey, channel_key
 
 logger = logging.getLogger(__name__)
@@ -27,20 +29,41 @@ def _callback_channel_key(message: Message | InaccessibleMessage) -> ChannelKey:
     return (message.chat.id, thread_id)
 
 
+def _backend_for(
+    dispatcher: BackendDispatcher,
+    topic_config: TopicConfig | None,
+    channel_key: ChannelKey,
+) -> SessionBackend:
+    """Resolve the engine-appropriate ``SessionBackend`` for *channel_key*."""
+    _, thread_id = channel_key
+    if topic_config is not None and thread_id is not None:
+        engine = topic_config.get_topic(thread_id).engine
+    else:
+        engine = "claude"
+    return dispatcher.for_engine(engine)
+
+
 @router.callback_query(F.data == "cancel_cc")
 async def handle_cancel_cc(
-    callback: CallbackQuery, queue: MessageQueue, tmux_manager: TmuxManager
+    callback: CallbackQuery,
+    queue: MessageQueue,
+    tmux_manager: TmuxManager,
+    topic_config: TopicConfig | None = None,
+    dispatcher: BackendDispatcher | None = None,
 ) -> None:
-    """Handle cancel button press: interrupt tmux CC or kill subprocess and clear queue."""
+    """Handle cancel button press: interrupt active backend or kill subprocess and clear queue."""
     message = callback.message
     if message is None:
         await callback.answer()
         return
 
     key = _callback_channel_key(message)
-    tmux_acted = tmux_manager.is_active(key)
+    backend: SessionBackend | TmuxManager = (
+        _backend_for(dispatcher, topic_config, key) if dispatcher is not None else tmux_manager
+    )
+    tmux_acted = backend.is_active(key)
     if tmux_acted:
-        await tmux_manager.cancel(key)
+        await backend.cancel(key)
     cancelled = await queue.cancel(key)
     acted = cancelled or tmux_acted
 
@@ -63,13 +86,20 @@ async def handle_cancel_cc(
 
 @router.message(F.text == t("ui.btn_cancel"))
 async def handle_cancel_text(
-    message: Message, queue: MessageQueue, tmux_manager: TmuxManager
+    message: Message,
+    queue: MessageQueue,
+    tmux_manager: TmuxManager,
+    topic_config: TopicConfig | None = None,
+    dispatcher: BackendDispatcher | None = None,
 ) -> None:
-    """Handle reply keyboard cancel button: interrupt tmux CC or kill subprocess and clear queue."""
+    """Handle reply-keyboard cancel: interrupt active backend or kill subprocess + clear queue."""
     key = channel_key(message)
-    tmux_acted = tmux_manager.is_active(key)
+    backend: SessionBackend | TmuxManager = (
+        _backend_for(dispatcher, topic_config, key) if dispatcher is not None else tmux_manager
+    )
+    tmux_acted = backend.is_active(key)
     if tmux_acted:
-        await tmux_manager.cancel(key)
+        await backend.cancel(key)
     cancelled = await queue.cancel(key)
 
     if cancelled or tmux_acted:
