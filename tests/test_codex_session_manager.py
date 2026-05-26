@@ -150,11 +150,12 @@ async def test_start_session_then_send_stream_happy_path(
 
     assert result == ""
     types = [e.type for e in captured]
-    assert "text" in types
+    # Codex deltas are dropped (see codex_events.parse_codex_notification);
+    # final text arrives once via item/completed (final_answer).
+    assert "text" not in types
     assert "result_message" in types
     assert "result" in types
-    # Order matters for streaming UX: deltas first, final message, then result sentinel.
-    assert types.index("text") < types.index("result_message") < types.index("result")
+    assert types.index("result_message") < types.index("result")
     # Persistence: codex_sessions entry written.
     persisted = json.loads(state_path.read_text())
     assert "codex_sessions" in persisted

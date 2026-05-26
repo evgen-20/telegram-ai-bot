@@ -27,9 +27,12 @@ def parse_codex_notification(notif: dict[str, Any]) -> list[StreamEvent]:
         return []
 
     if method == "item/agentMessage/delta":
-        delta = params.get("delta")
-        if isinstance(delta, str) and delta:
-            return [StreamEvent("text", delta)]
+        # Codex emits deltas at per-glyph granularity. Forwarding each as a
+        # Telegram message would spam the chat one char at a time. We drop
+        # the streaming deltas and rely on item/completed (phase=final_answer)
+        # to deliver the full text once at the end. Trade typing animation
+        # for one clean message; revisit when we have a per-channel
+        # edit-buffer for codex like the live-status one for status events.
         return []
 
     if method == "item/completed":

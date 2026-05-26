@@ -9,11 +9,14 @@ def _notif(method: str, **params: object) -> dict[str, object]:
     return {"jsonrpc": "2.0", "method": method, "params": params}
 
 
-def test_agent_message_delta_emits_text() -> None:
+def test_agent_message_delta_suppressed() -> None:
+    # Codex deltas are per-glyph; we drop them and rely on item/completed
+    # (final_answer) to deliver the full text once. Otherwise Telegram
+    # receives one message per character.
     events = parse_codex_notification(
         _notif("item/agentMessage/delta", threadId="t", itemId="i", delta="hi ")
     )
-    assert [(e.type, e.content) for e in events] == [("text", "hi ")]
+    assert events == []
 
 
 def test_agent_message_final_emits_result_message() -> None:
