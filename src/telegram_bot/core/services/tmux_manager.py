@@ -54,7 +54,6 @@ from typing import Literal
 from telegram_bot.core.messages import t
 from telegram_bot.core.services.bot_mcp_runtime import ensure_bot_runtime_mcp_config
 from telegram_bot.core.services.claude import Mode, StreamEvent
-from telegram_bot.core.services.providers import CODEX_ADAPTER
 from telegram_bot.core.services.tail_runner import TailRunner
 from telegram_bot.core.services.tmux_modal_watchdog import (
     ModalWatchdog,
@@ -122,8 +121,6 @@ from telegram_bot.core.tui.modal_detect import (
     DEFAULT_SETTLE_SEC,
     capture_pane,
     claude_input_bar_content,
-    codex_input_bar_content,
-    codex_prompt_visible_in_pane,
     collect_diagnostic_signals,
     is_modal_present,
     prompt_visible_in_pane,
@@ -153,14 +150,6 @@ _MODAL_DIAG_PANE_TAIL_LINES = 30
 _POLL_STEP_SEC = 0.05  # fine-grained poll interval inside send_direct's pane-verify loop
 _ENTER_RETRY_SETTLE_SEC = 0.5
 _ENTER_RETRY_LIMIT = 3
-
-# Codex `_safe_send_codex` paste-retry budget. Three attempts x 1.5s poll
-# each — the upper bound when codex is mid-render and the bracketed-paste
-# chip needs an extra frame to land. Beyond this we surface a modal alert
-# rather than silently looping forever.
-_CODEX_PASTE_RETRY_LIMIT = 3
-_CODEX_PASTE_POLL_BUDGET_SEC = 1.5
-_CODEX_PASTE_POLL_STEP_SEC = 0.1
 
 # Claude `_safe_send_and_enter` paste-retry budget. Symmetric with codex
 # above — covers the cold-start race observed 2026-04-26 23:22 UTC where
@@ -246,7 +235,6 @@ class TmuxManager:
         # poll-for-existence window inside the same 30s clock as readiness
         # (Decision 7). Cleared once the tail sees the file.
         self._spawn_deadlines: dict[ChannelKey, float] = {}
-        self._codex_start_snapshots: dict[ChannelKey, tuple[set[Path], float]] = {}
         # Channels whose most recent _spawn_tmux passed prompt-readiness but
         # failed the input probe (probe budget elapsed without the test char
         # appearing in the input bar). Set by `_spawn_tmux`, consumed by
@@ -491,33 +479,10 @@ class TmuxManager:
         )
         transcript_abs: str | None = None
         if provider == "codex":
-            if resume_session_id is not None:
-                session_id = resume_session_id
-                startup_cmd = CODEX_ADAPTER.build_tui_resume(
-                    cwd=cwd,
-                    session_id=resume_session_id,
-                    model=model,
-                    mcp_config=mcp_config,
-                )
-                current_state = self._sessions.get(channel_key)
-                saved_path = CODEX_ADAPTER.transcript_path_for_state(
-                    cwd=cwd,
-                    session_id=resume_session_id,
-                    transcript_path=current_state.transcript_path if current_state else None,
-                )
-                initial_offset = self._file_size(saved_path) if saved_path else 0
-                transcript_abs = str(saved_path) if saved_path else None
-            else:
-                existing = set(Path.home().joinpath(".codex", "sessions").glob("**/*.jsonl"))
-                since_wall = time.time()
-                session_id = None
-                startup_cmd = CODEX_ADAPTER.build_tui_start(
-                    cwd=cwd,
-                    model=model,
-                    mcp_config=mcp_config,
-                )
-                initial_offset = 0
-        elif resume_session_id is not None:
+            raise RuntimeError(
+                "TmuxManager no longer manages codex sessions; use CodexSessionManager instead"
+            )
+        if resume_session_id is not None:
             session_id = resume_session_id
             startup_cmd = session_manager.build_tmux_startup_args(  # type: ignore[attr-defined]
                 mode=mode,
@@ -546,7 +511,7 @@ class TmuxManager:
             mcp_config=mcp_config,
             chat_id=chat_id,
             offset=initial_offset,
-            runner_version="codex-tui-v1" if provider == "codex" else "claude-tui-v1",
+            runner_version="claude-tui-v1",
             provider=provider,
             model=model,
             transcript_path=transcript_abs,
@@ -594,16 +559,6 @@ class TmuxManager:
             await self._edit_engine_loading_message(
                 loading_msg, t("ui.engine_ready", engine=provider)
             )
-
-        # The codex transcript discovery snapshot must be saved on BOTH
-        # the happy path AND the probe-blocked path. After the user
-        # dismisses the modal through /tui and sends their first real
-        # message, `_locate_codex_transcript_after_send` diffs the
-        # post-send jsonl listing against this snapshot to find the new
-        # session_id. Without it, that lookup would scan an empty
-        # baseline and pick up unrelated transcripts.
-        if provider == "codex" and resume_session_id is None:
-            self._codex_start_snapshots[channel_key] = (existing, since_wall)
 
         self._sessions[channel_key] = state
         self._save_state()
@@ -699,10 +654,7 @@ class TmuxManager:
                 raise RuntimeError(f"tmux new-session failed: {stderr}")
 
         remaining = max(deadline - time.monotonic(), 0.0)
-        if provider == "codex":
-            ready = await self._await_codex_prompt_ready(name, timeout=remaining)
-        else:
-            ready = await await_prompt_ready(name, timeout=remaining, clock=time.monotonic)
+        ready = await await_prompt_ready(name, timeout=remaining, clock=time.monotonic)
         if not ready:
             await asyncio.to_thread(
                 subprocess.run, ["tmux", "kill-session", "-t", f"={name}"], capture_output=True
@@ -714,8 +666,7 @@ class TmuxManager:
         # needs ~5-8s after the glyph appears to finish loading MCP
         # servers; sending a paste during that window is silently lost.
         # Probe with one dot and wait for it to land in the input bar.
-        get_bar_fn = codex_input_bar_content if provider == "codex" else claude_input_bar_content
-        ready_input = await self._probe_input_ready(name, get_input_bar_fn=get_bar_fn)
+        ready_input = await self._probe_input_ready(name, get_input_bar_fn=claude_input_bar_content)
         if not ready_input:
             # Don't kill tmux. A failed probe is the strongest universal
             # signal that input is blocked — almost always a startup
@@ -741,37 +692,6 @@ class TmuxManager:
             # Hand the remaining budget to the next _tail_until_done so its
             # transcript poll-for-existence shares the same clock.
             self._spawn_deadlines[channel_key] = deadline
-
-    async def _await_codex_prompt_ready(self, session_name: str, timeout: float) -> bool:
-        """Codex TUI readiness: wait for the input prompt without fallback Enter."""
-        deadline = time.monotonic() + timeout
-        trust_handled = False
-        while time.monotonic() < deadline:
-            try:
-                pane = await capture_pane(session_name)
-            except (OSError, subprocess.SubprocessError):
-                return False
-            if (
-                not trust_handled
-                and "Do you trust the contents of this directory?" in pane
-                and "1. Yes, continue" in pane
-            ):
-                await asyncio.to_thread(
-                    subprocess.run,
-                    ["tmux", "send-keys", "-t", f"={session_name}:", "1", "Enter"],
-                    capture_output=True,
-                    check=False,
-                )
-                trust_handled = True
-                await asyncio.sleep(0.5)
-                continue
-            if CODEX_ADAPTER.is_prompt_ready(pane):
-                return True
-            await asyncio.sleep(0.5)
-        await asyncio.to_thread(
-            subprocess.run, ["tmux", "kill-session", "-t", f"={session_name}"], capture_output=True
-        )
-        return False
 
     async def _probe_input_ready(
         self,
@@ -800,9 +720,8 @@ class TmuxManager:
         (30s default), the TUI is presumed dead/stuck — return False so
         the caller kills the session.
 
-        `get_input_bar_fn` is provider-specific: pass
-        `codex_input_bar_content` for codex, `claude_input_bar_content`
-        for claude. Logic is provider-agnostic.
+        `get_input_bar_fn` is the claude input-bar reader; logic is
+        provider-agnostic but tmux_manager is claude-only as of Phase 9.
         """
         try:
             pane_before = await capture_pane(session_name)
@@ -1068,8 +987,6 @@ class TmuxManager:
         model. That risk dominates all trade-offs here.
         """
         session_name = state.session_name
-        if state.provider == "codex":
-            return await self._safe_send_codex(channel_key, state, prompt)
 
         # Claude path: simplified modal-guard pipeline. The legacy paste-
         # retry / Enter-retry loop below is unreachable dead code, kept on
@@ -1393,347 +1310,9 @@ class TmuxManager:
         )
         return False
 
-    async def _safe_send_codex(
-        self,
-        channel_key: ChannelKey,
-        state: TmuxSessionState,
-        prompt: str,
-    ) -> bool:
-        """Codex-specific send policy: Enter-only.
-
-        Algorithm (post-2026-04-26 simplification — Tab branches removed):
-
-          1. capture pane_before, abort if a modal is already up.
-          2. up to 3 paste attempts: send_text_to_tmux, poll for the
-             prompt or `[Pasted Content]` chip to appear in the input
-             bar; check for a modal between attempts.
-          3. capture pane_pre_enter, abort if a modal raced in after
-             the paste landed.
-          4. up to 3 Enter attempts: send Enter, settle, capture; abort
-             on modal_after_enter; succeed on input-bar cleared OR a
-             queue marker that names this prompt.
-
-        Every abort path posts a modal alert with a `reason` keyword that
-        names the failure shape — those reasons grep cleanly in the
-        TUI_ALERT_AUDIT log.
-
-        Tab is *not* used here. Empirical 2026-04-26 22:13 UTC test on
-        a busy codex confirmed Enter queues a follow-up identically to
-        Tab. Tab's only old purpose — `[Pasted Content N chars]` chip
-        expansion — is also obsolete now that bracketed paste (commit
-        8d1363a4) collapses correctly on the first Enter.
-        """
-        session_name = state.session_name
-
-        pane_before = await capture_pane(session_name)
-        if CODEX_ADAPTER.is_modal_present(pane_before):
-            logger.info(
-                "TUI_IO: send BLOCKED session=%s len=%d reason=modal_before_send",
-                session_name,
-                len(prompt),
-            )
-            await self._send_modal_alert(
-                channel_key, state, prompt, pane_before, reason="modal_before_send"
-            )
-            return False
-
-        pane_after = pane_before
-        delivered = False
-        for paste_attempt in range(1, _CODEX_PASTE_RETRY_LIMIT + 1):
-            # Double-check before re-pasting: when codex is mid-warmup
-            # the FIRST paste may land AFTER the previous attempt's poll
-            # deadline but BEFORE we get here. Issuing another paste in
-            # that case duplicates the prompt in the input bar — exactly
-            # the prod regression we saw 2026-04-26 23:36 UTC where the
-            # user's message appeared 3-4 times stacked. Capture once
-            # and check; only paste again if still not visible.
-            if paste_attempt > 1:
-                pane_recheck = await capture_pane(session_name)
-                if CODEX_ADAPTER.is_modal_present(pane_recheck):
-                    logger.info(
-                        "TUI_IO: codex modal raced into pane between paste attempts "
-                        "session=%s attempt=%d",
-                        session_name,
-                        paste_attempt,
-                    )
-                    await self._send_modal_alert(
-                        channel_key,
-                        state,
-                        prompt,
-                        pane_recheck,
-                        reason="modal_during_paste",
-                    )
-                    return False
-                if self._codex_delivery_visible(
-                    pane_before, pane_recheck, prompt
-                ) or self._codex_pasted_content_visible(pane_recheck):
-                    logger.info(
-                        "TUI_IO: codex previous paste landed late session=%s attempt=%d",
-                        session_name,
-                        paste_attempt,
-                    )
-                    pane_after = pane_recheck
-                    delivered = True
-                    break
-
-            try:
-                await send_text_to_tmux(session_name, prompt, submit_enter=False)
-            except (OSError, subprocess.SubprocessError):
-                logger.warning(
-                    "TUI_IO: codex send-paste failed session=%s attempt=%d",
-                    session_name,
-                    paste_attempt,
-                )
-                await self._send_modal_alert(
-                    channel_key, state, prompt, pane_before, reason="paste_send_error"
-                )
-                return False
-
-            # Do-while semantics: at least one capture per attempt even
-            # if budget is zero (unit tests patch budget to 0 to keep
-            # them fast; we still need one observation to decide).
-            deadline = time.monotonic() + _CODEX_PASTE_POLL_BUDGET_SEC
-            modal_seen = False
-            while True:
-                await asyncio.sleep(_CODEX_PASTE_POLL_STEP_SEC)
-                pane_after = await capture_pane(session_name)
-                if CODEX_ADAPTER.is_modal_present(pane_after):
-                    modal_seen = True
-                    break
-                if self._codex_delivery_visible(
-                    pane_before, pane_after, prompt
-                ) or self._codex_pasted_content_visible(pane_after):
-                    delivered = True
-                    break
-                if time.monotonic() >= deadline:
-                    break
-
-            if modal_seen:
-                logger.info(
-                    "TUI_IO: send BLOCKED session=%s reason=modal_during_paste attempt=%d",
-                    session_name,
-                    paste_attempt,
-                )
-                await self._send_modal_alert(
-                    channel_key, state, prompt, pane_after, reason="modal_during_paste"
-                )
-                return False
-            if delivered:
-                break
-
-            logger.info(
-                "TUI_IO: codex paste not yet visible session=%s attempt=%d; retrying",
-                session_name,
-                paste_attempt,
-            )
-
-        if not delivered:
-            pane_tail = "\n".join(
-                (pane_after or pane_before).splitlines()[-_MODAL_DIAG_PANE_TAIL_LINES:]
-            )
-            logger.warning(
-                "TUI_IO: codex paste not landed session=%s attempts=%d pane_tail=\n%s",
-                session_name,
-                _CODEX_PASTE_RETRY_LIMIT,
-                pane_tail,
-            )
-            await self._send_modal_alert(
-                channel_key,
-                state,
-                prompt,
-                pane_after or pane_before,
-                reason="paste_not_landed_after_retries",
-            )
-            return False
-
-        pane_pre_enter = await capture_pane(session_name)
-        if CODEX_ADAPTER.is_modal_present(pane_pre_enter):
-            logger.info(
-                "TUI_IO: send RACE session=%s reason=modal_after_paste",
-                session_name,
-            )
-            await self._send_modal_alert(
-                channel_key, state, prompt, pane_pre_enter, reason="modal_after_paste"
-            )
-            return False
-
-        pane_current = pane_pre_enter
-        for enter_attempt in range(1, _ENTER_RETRY_LIMIT + 1):
-            try:
-                await send_enter(session_name)
-            except (OSError, subprocess.SubprocessError):
-                logger.warning(
-                    "TUI_IO: codex send Enter failed session=%s attempt=%d",
-                    session_name,
-                    enter_attempt,
-                )
-                await self._send_modal_alert(
-                    channel_key, state, prompt, pane_current, reason="enter_send_error"
-                )
-                return False
-
-            await asyncio.sleep(_ENTER_RETRY_SETTLE_SEC)
-            pane_after_enter = await capture_pane(session_name)
-            if not pane_after_enter:
-                logger.warning(
-                    "TUI_IO: codex Enter capture empty session=%s attempt=%d",
-                    session_name,
-                    enter_attempt,
-                )
-                await self._send_modal_alert(
-                    channel_key,
-                    state,
-                    prompt,
-                    pane_current,
-                    reason="enter_capture_empty",
-                )
-                return False
-
-            if CODEX_ADAPTER.is_modal_present(pane_after_enter):
-                # A modal that surfaced AFTER our Enter is still cause to
-                # alert: we cannot tell from the pane alone whether the
-                # modal pre-existed (Enter just confirmed it) or codex
-                # raised it as a response. The /model dialog is the
-                # cautionary tale — silently confirming settings is far
-                # worse than asking the user to re-send a message.
-                logger.info(
-                    "TUI_IO: codex Enter opened modal session=%s attempt=%d",
-                    session_name,
-                    enter_attempt,
-                )
-                await self._send_modal_alert(
-                    channel_key,
-                    state,
-                    prompt,
-                    pane_after_enter,
-                    reason="modal_after_enter",
-                )
-                return False
-
-            # Codex success signal: the input bar no longer carries our
-            # prompt. Both delivery shapes — direct submit on idle and
-            # queue-on-busy — drop the prompt out of the codex input bar
-            # (the queue ack `Messages to be submitted ...` doesn't render in
-            # the input bar). Do NOT short-circuit on a queue marker
-            # alone: a stale queue from a previous turn can sit in the
-            # pane while our prompt still occupies the input bar — that
-            # is a *retry* state, not success. The 2026-04-26
-            # `test_codex_send_direct_rejects_stale_pending_queue_marker`
-            # regression pins this.
-            if not self._codex_prompt_still_in_input_bar(pane_after_enter, prompt):
-                if enter_attempt > 1:
-                    logger.info(
-                        "TUI_IO: codex Enter accepted after retry session=%s attempt=%d",
-                        session_name,
-                        enter_attempt,
-                    )
-                else:
-                    logger.info(
-                        "TUI_IO: codex Enter accepted session=%s",
-                        session_name,
-                    )
-                return True
-
-            if enter_attempt < _ENTER_RETRY_LIMIT:
-                logger.info(
-                    "TUI_IO: codex Enter did not clear input session=%s attempt=%d; retrying",
-                    session_name,
-                    enter_attempt,
-                )
-            pane_current = pane_after_enter
-
-        logger.warning(
-            "TUI_IO: codex Enter exhausted retries session=%s attempts=%d",
-            session_name,
-            _ENTER_RETRY_LIMIT,
-        )
-        await self._send_modal_alert(
-            channel_key,
-            state,
-            prompt,
-            pane_current,
-            reason="enter_did_not_clear_after_retries",
-        )
-        return False
-
-    @staticmethod
-    def _codex_prompt_visible(pane: str, prompt: str) -> bool:
-        if not prompt.strip():
-            return False
-
-        # Codex wraps long pasted input in the visible TUI pane. A token like
-        # "open-source" can render as "open-\nsource", which becomes
-        # "open- source" after whitespace collapse. Match against the live
-        # pane tail with hyphen-wraps normalized back to a single token.
-        lines = pane.splitlines()
-        while lines and not lines[-1].strip():
-            lines.pop()
-        pane_tail = "\n".join(lines[-80:])
-        if prompt in pane_tail:
-            return True
-
-        normalized = " ".join(prompt.split())
-        pane_normalized = " ".join(pane_tail.split())
-        pane_hyphen_compact = re.sub(r"-\s+", "-", pane_normalized)
-
-        candidates = [normalized]
-        if len(normalized) > 48:
-            candidates.append(normalized[:48])
-        if len(normalized) > 32:
-            candidates.append(normalized[-32:])
-
-        return any(
-            candidate and (candidate in pane_normalized or candidate in pane_hyphen_compact)
-            for candidate in candidates
-        )
-
-    def _codex_delivery_visible(self, pane_before: str, pane_after: str, prompt: str) -> bool:
-        if codex_prompt_visible_in_pane(pane_before, pane_after, prompt):
-            return True
-        if CODEX_ADAPTER.is_modal_present(pane_after):
-            return False
-        return self._codex_prompt_visible(pane_after, prompt) and not self._codex_prompt_visible(
-            pane_before, prompt
-        )
-
-    @staticmethod
-    def _codex_pending_after_tool_call_visible(pane: str) -> bool:
-        normalized = " ".join(pane.casefold().split())
-        return (
-            "messages to be submitted after next tool call" in normalized
-            and "press esc to interrupt and send immediately" in normalized
-        )
-
-    @staticmethod
-    def _codex_queued_followup_visible(pane: str) -> bool:
-        normalized = " ".join(pane.casefold().split())
-        return "queued follow-up inputs" in normalized or "edit last queued message" in normalized
-
-    @staticmethod
-    def _codex_pasted_content_visible(pane: str) -> bool:
-        return "[pasted content" in pane.casefold()
-
-    @staticmethod
-    def _codex_prompt_still_in_input_bar(pane: str, prompt: str) -> bool:
-        bar = codex_input_bar_content(pane)
-        if not bar:
-            return False
-        if "[pasted content" in bar.casefold():
-            return True
-
-        normalized = " ".join(prompt.split())
-        bar_normalized = " ".join(bar.split())
-        bar_hyphen_compact = re.sub(r"-\s+", "-", bar_normalized)
-        candidates = [normalized]
-        if len(normalized) > 48:
-            candidates.append(normalized[:48])
-        if len(normalized) > 32:
-            candidates.append(normalized[-32:])
-        return any(
-            candidate and (candidate in bar_normalized or candidate in bar_hyphen_compact)
-            for candidate in candidates
-        )
-
+    # _safe_send_codex and the _codex_* visibility helpers were removed in
+    # Phase 9.2 — codex sessions are now driven by CodexSessionManager via
+    # the Codex app-server protocol; tmux is claude-only.
     @staticmethod
     def _pane_contains_prompt_snippet(pane: str, prompt: str) -> bool:
         if not pane or not prompt.strip():
@@ -1750,21 +1329,6 @@ class TmuxManager:
             candidate and (candidate in pane_normalized or candidate in pane_hyphen_compact)
             for candidate in candidates
         )
-
-    @classmethod
-    def _codex_queue_contains_prompt(cls, pane: str, prompt: str) -> bool:
-        lines = pane.splitlines()
-        for idx, line in enumerate(lines):
-            line_norm = " ".join(line.casefold().split())
-            if (
-                "queued follow-up inputs" not in line_norm
-                and "messages to be submitted after next tool call" not in line_norm
-            ):
-                continue
-            window = "\n".join(lines[idx : idx + 24])
-            if cls._pane_contains_prompt_snippet(window, prompt):
-                return True
-        return False
 
     @classmethod
     def _claude_queue_contains_prompt(cls, pane: str, prompt: str) -> bool:
@@ -2095,11 +1659,7 @@ class TmuxManager:
         pane = await capture_pane(state.session_name)
         if not pane:
             return
-        modal_present = (
-            CODEX_ADAPTER.is_modal_present(pane)
-            if state.provider == "codex"
-            else is_modal_present(pane)
-        )
+        modal_present = is_modal_present(pane)
         if modal_present:
             if self._last_modal_pane.get(channel_key) == pane:
                 return
@@ -2163,30 +1723,6 @@ class TmuxManager:
                 if not delivered:
                     # _safe_send_and_enter posted an alert; do not start tail.
                     return ""
-
-                if state.provider == "codex" and not state.transcript_path:
-                    try:
-                        await self._locate_codex_transcript_after_send(channel_key, state)
-                    except RuntimeError:
-                        logger.warning(
-                            "Codex TUI transcript discovery failed after delivery; "
-                            "leaving session alive channel=%s session=%s",
-                            channel_key,
-                            state.session_name,
-                            exc_info=True,
-                        )
-                        ret = on_event(
-                            StreamEvent(
-                                "result_message",
-                                "Codex принял сообщение, но бот не смог найти transcript "
-                                "для стриминга ответа. Сессия оставлена живой; открой /tui "
-                                "или отправь следующее сообщение после завершения работы.",
-                            )
-                        )
-                        if asyncio.iscoroutine(ret):
-                            await ret
-                        await self.close_buffer(channel_key)
-                        return ""
 
                 output_path = self._transcript_path_for_state(state)
             if output_path is None:
@@ -2291,37 +1827,23 @@ class TmuxManager:
             await self._wait_for_tail_exit(channel_key)
 
         if state.provider == "codex":
-            state.mcp_config = self._ensure_runtime_mcp_config(
-                channel_key=channel_key,
-                base_mcp_config=state.base_mcp_config or state.mcp_config,
-                session_dir=Path(state.session_dir),
-                session_manager=session_manager,
+            raise RuntimeError(
+                "TmuxManager no longer manages codex sessions; use CodexSessionManager instead"
             )
-            existing = set(Path.home().joinpath(".codex", "sessions").glob("**/*.jsonl"))
-            since_wall = time.time()
-            new_session_id = None
-            startup_cmd = CODEX_ADAPTER.build_tui_start(
-                cwd=state.cwd,
-                model=state.model,
-                mcp_config=state.mcp_config,
-            )
-            state.session_id = None
-            state.transcript_path = None
-        else:
-            state.mcp_config = self._ensure_runtime_mcp_config(
-                channel_key=channel_key,
-                base_mcp_config=state.base_mcp_config or state.mcp_config,
-                session_dir=Path(state.session_dir),
-                session_manager=session_manager,
-            )
-            new_session_id = generate_session_uuid()
-            startup_cmd = session_manager.build_tmux_startup_args(  # type: ignore[attr-defined]
-                mode=state.mode,
-                mcp_config=state.mcp_config,
-                session_id_new=new_session_id,
-            )
-            state.session_id = new_session_id
-            state.transcript_path = None
+        state.mcp_config = self._ensure_runtime_mcp_config(
+            channel_key=channel_key,
+            base_mcp_config=state.base_mcp_config or state.mcp_config,
+            session_dir=Path(state.session_dir),
+            session_manager=session_manager,
+        )
+        new_session_id = generate_session_uuid()
+        startup_cmd = session_manager.build_tmux_startup_args(  # type: ignore[attr-defined]
+            mode=state.mode,
+            mcp_config=state.mcp_config,
+            session_id_new=new_session_id,
+        )
+        state.session_id = new_session_id
+        state.transcript_path = None
 
         state.offset = 0
         self._save_state()
@@ -2345,8 +1867,6 @@ class TmuxManager:
             state.offset = 0
             self._save_state()
             raise
-        if state.provider == "codex":
-            self._codex_start_snapshots[channel_key] = (existing, since_wall)
         logger.info(
             "Respawned tmux session %s with fresh CC session %s",
             state.session_name,
@@ -2377,14 +1897,15 @@ class TmuxManager:
         # the helper's UUID4 assert would otherwise raise AssertionError for
         # legacy or malformed ids.
         if state.provider == "codex":
-            target_transcript = self._find_codex_transcript(new_session_id, state.cwd)
-        else:
-            from telegram_bot.core.tui.paths import _SESSION_ID_RE
+            raise RuntimeError(
+                "TmuxManager no longer manages codex sessions; use CodexSessionManager instead"
+            )
+        from telegram_bot.core.tui.paths import _SESSION_ID_RE
 
-            if not _SESSION_ID_RE.fullmatch(new_session_id):
-                logger.info("switch_session: malformed target session_id %r", new_session_id)
-                return False
-            target_transcript = transcript_path(state.cwd, new_session_id)
+        if not _SESSION_ID_RE.fullmatch(new_session_id):
+            logger.info("switch_session: malformed target session_id %r", new_session_id)
+            return False
+        target_transcript = transcript_path(state.cwd, new_session_id)
         if target_transcript is None:
             logger.info("switch_session: target transcript missing for %s", new_session_id)
             return False
@@ -2410,19 +1931,11 @@ class TmuxManager:
             session_dir=Path(state.session_dir),
             session_manager=session_manager,
         )
-        if state.provider == "codex":
-            startup_cmd = CODEX_ADAPTER.build_tui_resume(
-                cwd=state.cwd,
-                session_id=new_session_id,
-                model=state.model,
-                mcp_config=state.mcp_config,
-            )
-        else:
-            startup_cmd = session_manager.build_tmux_startup_args(  # type: ignore[attr-defined]
-                mode=state.mode,
-                mcp_config=state.mcp_config,
-                resume_session_id=new_session_id,
-            )
+        startup_cmd = session_manager.build_tmux_startup_args(  # type: ignore[attr-defined]
+            mode=state.mode,
+            mcp_config=state.mcp_config,
+            resume_session_id=new_session_id,
+        )
         try:
             await self._spawn_tmux(
                 name=state.session_name,
@@ -2437,7 +1950,7 @@ class TmuxManager:
             self._save_state()
             raise
         state.session_id = new_session_id
-        state.transcript_path = str(target_transcript) if state.provider == "codex" else None
+        state.transcript_path = None
         # Seed past all events already in the target transcript — offset=0
         # would re-emit every historical event through on_event.
         state.offset = self._file_size(target_transcript)
@@ -2603,7 +2116,6 @@ class TmuxManager:
         # are intentionally stable so waiters cannot split across old/new locks.
         self._last_modal_pane.pop(channel_key, None)
         self._spawn_deadlines.pop(channel_key, None)
-        self._codex_start_snapshots.pop(channel_key, None)
 
     async def _kill_tmux_only(self, channel_key: ChannelKey, state: TmuxSessionState) -> None:
         """Kill tmux process only; caller owns state lifecycle."""
@@ -2754,9 +2266,7 @@ class TmuxManager:
     @staticmethod
     def _validate_session_id_shape(session_id: str, provider: str) -> bool:
         if provider == "codex":
-            from telegram_bot.core.tui.paths import _CODEX_SESSION_ID_RE
-
-            return bool(_CODEX_SESSION_ID_RE.fullmatch(session_id))
+            return False
         from telegram_bot.core.tui.paths import _SESSION_ID_RE
 
         return bool(_SESSION_ID_RE.fullmatch(session_id))
@@ -2770,6 +2280,7 @@ class TmuxManager:
         session_id: str,
         transcript_path: Path,
     ) -> TmuxSessionState:
+        _ = transcript_path
         name = self._make_name(channel_key)
         return TmuxSessionState(
             session_name=name,
@@ -2780,10 +2291,10 @@ class TmuxManager:
             mcp_config=runtime.mcp_config or "",
             chat_id=channel_key[0],
             offset=0,
-            runner_version="codex-tui-v1" if provider == "codex" else "claude-tui-v1",
+            runner_version="claude-tui-v1",
             provider=provider,
             model=runtime.model,
-            transcript_path=str(transcript_path) if provider == "codex" else None,
+            transcript_path=None,
             base_mcp_config=runtime.mcp_config,
         )
 
@@ -2803,49 +2314,10 @@ class TmuxManager:
         """
         self._state_store.save(self._sessions)
 
-    async def _locate_codex_transcript_after_send(
-        self, channel_key: ChannelKey, state: TmuxSessionState
-    ) -> None:
-        existing, since_wall = self._codex_start_snapshots.get(channel_key, (set(), time.time()))
-        try:
-            info = await CODEX_ADAPTER.locate_tui_transcript(
-                cwd=state.cwd,
-                existing=existing,
-                since_wall_time=since_wall,
-                timeout_sec=30.0,
-            )
-        except Exception:
-            raise RuntimeError("Codex TUI transcript discovery failed") from None
-        state.session_id = info.session_id
-        state.transcript_path = str(info.transcript_path)
-        self._codex_start_snapshots.pop(channel_key, None)
-        self._save_state()
-
     def _transcript_path_for_state(self, state: TmuxSessionState) -> Path | None:
-        if state.provider == "codex":
-            if not state.transcript_path:
-                return None
-            return Path(state.transcript_path)
         if not state.session_id:
             return None
         return transcript_path(state.cwd, state.session_id)
-
-    def _codex_transcript_for_state(self, channel_key: ChannelKey) -> Path | None:
-        state = self._sessions.get(channel_key)
-        if state is None or not state.session_id:
-            return None
-        path = CODEX_ADAPTER.transcript_path_for_state(
-            cwd=state.cwd,
-            session_id=state.session_id,
-            transcript_path=state.transcript_path,
-        )
-        if path is not None:
-            state.transcript_path = str(path)
-        return path
-
-    @staticmethod
-    def _find_codex_transcript(session_id: str, cwd: str) -> Path | None:
-        return CODEX_ADAPTER.find_tui_transcript(cwd=cwd, session_id=session_id)
 
     # Public alias for callers outside the class (shutdown handlers, etc.).
     # External code should not poke at `_save_state` directly.

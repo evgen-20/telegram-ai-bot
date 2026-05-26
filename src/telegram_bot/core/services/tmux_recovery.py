@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any, cast
 
 from telegram_bot.core.services.bot_mcp_runtime import ensure_bot_runtime_mcp_config
 from telegram_bot.core.services.claude import StreamEvent
-from telegram_bot.core.services.providers import CODEX_ADAPTER
 from telegram_bot.core.services.tmux_spawn import file_size, spawn_tmux_sync
 from telegram_bot.core.services.tmux_state import TmuxSessionState, _normalize_state_dict
 from telegram_bot.core.types import ChannelKey
@@ -35,17 +34,6 @@ def _transcript_path(cwd: str, session_id: str) -> Path:
 
 
 def _state_transcript_path(state: TmuxSessionState) -> Path | None:
-    if state.provider == "codex":
-        if not state.session_id:
-            return None
-        path = CODEX_ADAPTER.transcript_path_for_state(
-            cwd=state.cwd,
-            session_id=state.session_id,
-            transcript_path=state.transcript_path,
-        )
-        if path is not None:
-            state.transcript_path = str(path)
-        return path
     if not state.session_id:
         return None
     return _transcript_path(state.cwd, state.session_id)
@@ -88,13 +76,7 @@ def build_resume_startup_cmd(
     session_manager: object,
 ) -> list[str]:
     """Build provider-specific TUI resume argv."""
-    if provider == "codex":
-        return CODEX_ADAPTER.build_tui_resume(
-            cwd=str(cwd),
-            session_id=session_id,
-            model=model,
-            mcp_config=mcp_config,
-        )
+    _ = (cwd, provider)
     return cast(
         list[str],
         session_manager.build_tmux_startup_args(  # type: ignore[attr-defined]
@@ -141,12 +123,21 @@ def restore_all(
             # default "tui-v1" would silently overwrite the legacy marker
             # for old state.json entries missing runner_version.
             state = TmuxSessionState(**_normalize_state_dict(data))
+            # Codex sessions are owned by CodexSessionManager since Phase 7;
+            # legacy state.json entries from before the split are ignored
+            # here and pruned on the next `manager._save_state()` below.
+            if state.provider == "codex":
+                logger.info(
+                    "Skipping legacy codex tmux state entry for %s (managed by "
+                    "CodexSessionManager now)",
+                    key_str,
+                )
+                continue
             alive = manager._tmux_alive(state.session_name)
             rv = state.runner_version
 
             is_claude_tui = rv in {"tui-v1", "claude-tui-v1"} and state.provider == "claude"
-            is_codex_tui = rv == "codex-tui-v1" and state.provider == "codex"
-            is_supported_tui = is_claude_tui or is_codex_tui
+            is_supported_tui = is_claude_tui
 
             if alive and is_supported_tui:
                 _ensure_runtime_mcp_config(

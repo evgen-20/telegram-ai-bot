@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import Protocol
 
 from telegram_bot.core.services.claude import StreamEvent
-from telegram_bot.core.services.providers import CODEX_ADAPTER
 from telegram_bot.core.tui.transcript import parse_transcript_event
 from telegram_bot.core.types import ChannelKey
 
@@ -53,17 +52,6 @@ OFFSET_SAVE_INTERVAL = 10.0  # seconds between periodic offset saves
 ON_EVENT_SLOW_WARN_SEC = 5.0  # warn when a single on_event dispatch exceeds this
 EVENT_QUEUE_BACKLOG_WARN = 500  # warn once per tail when backlog exceeds this
 SENDER_DRAIN_GRACE_SEC = 30.0  # how long we wait for the sender to flush on normal exit
-
-# Codex-only post-`task_complete` grace period. Codex emits the
-# `task_complete` event when it considers the turn finished, but
-# empirically (2026-04-26 incident, plan.md §"Факт 2") it can keep
-# writing the final paragraph 10+ seconds *after* that — and the prior
-# tail loop closed on `done=True` immediately, losing 13 seconds of
-# final answer. The fix: when codex signals done, hold the tail open
-# for this many seconds; any further event resets the timer; only
-# silence past the deadline closes the loop.
-TASK_COMPLETE_GRACE_SEC = 60.0
-
 
 OnEventCallable = Callable[[StreamEvent], Awaitable[None] | None]
 
@@ -131,12 +119,6 @@ class TailRunner:
         self._warned_rotated_sids: set[str] = set()
         self._backlog_warned: bool = False
         self._event_queue: asyncio.Queue[StreamEvent | None] = asyncio.Queue()
-        # Codex post-task_complete grace deadline: monotonic seconds at
-        # which the tail will close if no further events arrive. None
-        # while the turn is still in progress; set when `task_complete`
-        # is observed; pushed forward on every subsequent event so a
-        # late-streaming codex doesn't lose its final paragraph.
-        self._task_complete_grace_deadline: float | None = None
 
     async def run(self) -> tuple[str, str | None]:
         """Entry point. Returns (result_text, observed_session_id)."""
@@ -187,15 +169,6 @@ class TailRunner:
                     )
                     break
                 if await self._process_lines(lines):
-                    break
-                if (
-                    self._task_complete_grace_deadline is not None
-                    and time.monotonic() >= self._task_complete_grace_deadline
-                ):
-                    logger.info(
-                        "Tmux tail task_complete grace expired session=%s",
-                        session_name,
-                    )
                     break
 
                 now = time.monotonic()
@@ -338,26 +311,12 @@ class TailRunner:
         """Process parsed JSON lines.
 
         For CC TUI transcripts this returns False — they don't emit
-        terminal events. For codex, `task_complete` would normally
-        return True (the tail closes); instead we open a grace window
-        (`TASK_COMPLETE_GRACE_SEC`) so codex can keep streaming its
-        final paragraph after declaring done. The grace window is
-        evaluated by the caller in `run()` against
-        `_task_complete_grace_deadline`.
-
-        Any event arriving while the grace window is active resets the
-        deadline — the tail only closes after a full silent grace
-        period.
+        terminal events. (Phase 9: codex sessions no longer flow through
+        TmuxManager/TailRunner; the `task_complete` grace window once
+        carried here moved into CodexSessionManager.)
         """
         for line in lines:
-            done = False
-            if getattr(self._state, "provider", "claude") == "codex":
-                parsed = CODEX_ADAPTER.parse_tui_event(line)
-                events = parsed.events
-                new_sid = parsed.session_id
-                done = parsed.done
-            else:
-                events, new_sid = parse_transcript_event(line)
+            events, new_sid = parse_transcript_event(line)
             if new_sid:
                 # Observability only — state.session_id is owned by
                 # start_session / switch_session / clear_context, never by
@@ -391,24 +350,6 @@ class TailRunner:
                     continue
                 self._enqueue(event)
 
-            # Reset the grace window on any event that arrives after
-            # task_complete: codex is still streaming, give it more time.
-            if events and self._task_complete_grace_deadline is not None:
-                self._task_complete_grace_deadline = time.monotonic() + TASK_COMPLETE_GRACE_SEC
-
-            if done:
-                if getattr(self._state, "provider", "claude") == "codex":
-                    if self._task_complete_grace_deadline is None:
-                        self._task_complete_grace_deadline = (
-                            time.monotonic() + TASK_COMPLETE_GRACE_SEC
-                        )
-                        logger.info(
-                            "Tmux tail entered task_complete grace session=%s grace_sec=%.1f",
-                            self._session_name(),
-                            TASK_COMPLETE_GRACE_SEC,
-                        )
-                else:
-                    return True
         return False
 
     # --- thin accessors on state (structural, see _StateAccess protocol) ---
