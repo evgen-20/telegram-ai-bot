@@ -11,10 +11,14 @@ stay private to that backend's concrete class.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from telegram_bot.core.services.cc_events import StreamEvent
-from telegram_bot.core.services.topic_config import Engine
+from telegram_bot.core.services.cc_modes import Mode
+from telegram_bot.core.services.tmux_manager import SwitchResult
+from telegram_bot.core.services.topic_config import Engine, TopicConfig
+from telegram_bot.core.services.topic_runtime import BotDefaults
 from telegram_bot.core.types import ChannelKey
 
 
@@ -38,11 +42,14 @@ class SessionBackend(Protocol):
         self,
         channel_key: ChannelKey,
         *,
+        mode: Mode,
         cwd: str,
-        resume: bool,
-        session_id: str | None = None,
+        mcp_config: str,
+        chat_id: int,
+        session_manager: object,
+        resume_session_id: str | None = None,
+        provider: str = "claude",
         model: str | None = None,
-        mcp_config: str | None = None,
     ) -> None: ...
 
     async def send_stream(
@@ -63,18 +70,21 @@ class SessionBackend(Protocol):
     async def switch_session(
         self,
         channel_key: ChannelKey,
-        *,
-        cwd: str,
-        session_id: str,
-    ) -> None: ...
+        new_session_id: str,
+        session_manager: object,
+    ) -> bool: ...
 
     async def switch_or_start_session(
         self,
         channel_key: ChannelKey,
+        target_session_id: str,
+        target_provider: Engine,
+        target_transcript_path: Path,
         *,
-        cwd: str,
-        session_id: str | None,
-    ) -> None: ...
+        session_manager: object,
+        topic_config: TopicConfig,
+        defaults: BotDefaults,
+    ) -> SwitchResult: ...
 
 
 class BackendDispatcher:
