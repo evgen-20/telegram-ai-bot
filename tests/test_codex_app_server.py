@@ -8,7 +8,10 @@ from typing import Any
 
 import pytest
 
-from telegram_bot.core.services.codex_app_server import CodexAppServerClient
+from telegram_bot.core.services.codex_app_server import (
+    CodexAppServerClient,
+    CodexEofError,
+)
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "codex_app_server"
 
@@ -123,3 +126,26 @@ async def test_auto_approve_exec_command_approval() -> None:
     assert '"decision": "approve"' in stderr or '"decision":"approve"' in stderr
     # The approval response must reference the original server request id.
     assert '"id": 100' in stderr or '"id":100' in stderr
+
+
+async def _no_notify(n: dict[str, Any]) -> None:
+    pass
+
+
+@pytest.mark.asyncio
+async def test_pending_request_fails_with_eof() -> None:
+    # Print the initialize reply, then close stdout (exec 1>&-) but keep the
+    # process alive briefly so the client's subsequent write to stdin doesn't
+    # fail with ConnectionResetError. The read loop will see EOF on stdout
+    # and resolve the pending thread/start future with CodexEofError.
+    fixture = FIXTURE_DIR / "eof_after_init.jsonl"
+    script = f"cat {fixture!s}; exec 1>&-; sleep 1"
+    cmd = ["bash", "-c", script]
+    client = CodexAppServerClient(command=cmd, on_notification=_no_notify)
+    async with client:
+        await client.initialize(client_name="t", client_version="0")
+        with pytest.raises(CodexEofError):
+            # thread_start has no fixture response — subprocess closes stdout
+            # after printing only the initialize reply, so this pending future
+            # is resolved with CodexEofError.
+            await client.thread_start(cwd="/tmp", model=None)
