@@ -160,3 +160,95 @@ async def test_start_session_then_send_stream_happy_path(
     assert "codex_sessions" in persisted
     assert f"{channel[0]}:{channel[1]}" in persisted["codex_sessions"]
     assert persisted["codex_sessions"][f"{channel[0]}:{channel[1]}"]["thread_id"] == "th-1"
+
+
+@pytest.mark.asyncio
+async def test_send_stream_emits_image_message(daemon_mock: AsyncMock, tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}")
+    mgr = CodexSessionManager(
+        daemon=daemon_mock,
+        state_path=state_path,
+        proxy_command_factory=lambda: ["bash", "-c", "cat"],
+    )
+
+    captured: list[StreamEvent] = []
+
+    async def on_event(ev: StreamEvent) -> None:
+        captured.append(ev)
+
+    img = tmp_path / "x.png"
+    img.write_bytes(b"\x89PNG" + b"\0" * 6000)
+
+    class FakeClient:
+        def __init__(
+            self,
+            *,
+            command: list[str],
+            on_notification: Callable[[dict[str, Any]], Awaitable[None] | None],
+        ) -> None:
+            self._on_notification = on_notification
+
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def initialize(self, *, client_name: str, client_version: str) -> dict[str, Any]:
+            return {"serverInfo": {}}
+
+        async def thread_start(self, *, cwd: str, model: str | None) -> dict[str, Any]:
+            return {"threadId": "t"}
+
+        async def turn_start(self, *, thread_id: str, prompt: str) -> None:
+            await self._emit(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "item": {
+                            "id": "i",
+                            "type": "imageGeneration",
+                            "status": "completed",
+                            "savedPath": str(img),
+                            "revisedPrompt": "cat",
+                        },
+                    },
+                }
+            )
+            await self._emit(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": "t1",
+                        "status": "completed",
+                    },
+                }
+            )
+
+        async def close(self) -> None:
+            return None
+
+        async def _emit(self, notif: dict[str, Any]) -> None:
+            ret = self._on_notification(notif)
+            if hasattr(ret, "__await__"):
+                await ret  # type: ignore[misc]
+
+    mgr._client_factory = FakeClient  # type: ignore[assignment]
+    ch = (-1, 1)
+    await mgr.start_session(
+        ch,
+        mode="free",
+        cwd="/tmp",
+        mcp_config="",
+        chat_id=ch[0],
+        session_manager=object(),
+        resume_session_id=None,
+        provider="codex",
+        model=None,
+    )
+    await mgr.send_stream(ch, "draw a cat", on_event)
+
+    assert any(e.type == "image_message" and e.content == str(img) for e in captured)
