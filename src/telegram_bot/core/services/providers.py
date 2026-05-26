@@ -7,59 +7,30 @@ The bot has two independent axes:
 
 Keeping the provider-specific command and parser contracts here prevents
 `exec_mode` from being overloaded with engine names.
+
+Phase 9: the in-tmux Codex TUI integration is gone. Codex is now driven by
+`CodexSessionManager` via the `codex app-server` protocol. What stays in
+this module: the engine-display helper, the `ExecCommand`/`ExecParseResult`
+dataclasses, and `CodexAdapter` reduced to its non-TUI surface — `binary()`
+(used by the codex app-server stack) and `parse_exec_event` (used by the
+subprocess `codex exec` path in `claude.py`).
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import shutil
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from telegram_bot.core.services.cc_events import StreamEvent, _tool_status
-from telegram_bot.core.services.codex_mcp import build_codex_mcp_config_args
 
 logger = logging.getLogger(__name__)
 
 Engine = Literal["claude", "codex"]
-_CODEX_BOT_HOME = Path.home() / ".codex-bot"
-_CODEX_HOME = Path.home() / ".codex"
-
-
-def _ensure_codex_global_skill_links() -> None:
-    """Expose global Codex skills inside the bot's isolated CODEX_HOME."""
-    source_root = _CODEX_HOME / "skills"
-    target_root = _CODEX_BOT_HOME / "skills"
-    if not source_root.is_dir() or not target_root.is_dir():
-        return
-
-    for target in target_root.iterdir():
-        if not target.is_symlink():
-            continue
-        try:
-            resolved = target.resolve(strict=True)
-        except FileNotFoundError:
-            target.unlink()
-            continue
-        try:
-            resolved.relative_to(source_root)
-        except ValueError:
-            continue
-        if not (resolved / "SKILL.md").is_file():
-            target.unlink()
-
-    for source in source_root.iterdir():
-        if not source.is_dir() or not (source / "SKILL.md").is_file():
-            continue
-        target = target_root / source.name
-        if target.exists() or target.is_symlink():
-            continue
-        target.symlink_to(source, target_is_directory=True)
 
 
 def engine_display_name(engine: str) -> str:
@@ -69,20 +40,6 @@ def engine_display_name(engine: str) -> str:
     if engine == "claude":
         return "Claude Code"
     return engine
-
-
-def _codex_tui_prefix() -> list[str]:
-    """Use an isolated Codex home for TUI sessions when provisioned.
-
-    Bot TUI sessions pass topic-scoped MCP servers through CLI overrides. A
-    large or broken user-level ~/.codex/config.toml should not block fresh
-    chat creation, so production can provide ~/.codex-bot with shared auth and
-    a minimal config.
-    """
-    if (_CODEX_BOT_HOME / "config.toml").exists():
-        _ensure_codex_global_skill_links()
-        return ["env", f"CODEX_HOME={_CODEX_BOT_HOME}"]
-    return []
 
 
 @dataclass(frozen=True)
@@ -99,46 +56,10 @@ class ExecParseResult:
     session_id: str | None = None
 
 
-@dataclass(frozen=True)
-class TuiParseResult:
-    events: list[StreamEvent]
-    session_id: str | None = None
-    done: bool = False
-
-
-@dataclass(frozen=True)
-class TuiSessionInfo:
-    session_id: str
-    transcript_path: Path
-
-
 class ProviderAdapter(Protocol):
     name: Engine
 
     def parse_exec_event(self, raw: str) -> ExecParseResult: ...
-
-    def build_tui_start(
-        self, *, cwd: str, model: str | None = None, mcp_config: str | None = None
-    ) -> list[str]: ...
-
-    def build_tui_resume(
-        self,
-        *,
-        cwd: str,
-        session_id: str,
-        model: str | None = None,
-        mcp_config: str | None = None,
-    ) -> list[str]: ...
-
-    def parse_tui_event(self, raw: str) -> TuiParseResult: ...
-
-    def is_prompt_ready(self, pane: str) -> bool: ...
-
-    def is_modal_present(self, pane: str) -> bool: ...
-
-    def transcript_path_for_state(
-        self, *, cwd: str, session_id: str, transcript_path: str | None
-    ) -> Path | None: ...
 
 
 def _load_json(raw: str) -> dict[str, Any] | None:
@@ -151,23 +72,6 @@ def _load_json(raw: str) -> dict[str, Any] | None:
 
 class CodexAdapter:
     name: Engine = "codex"
-    _MODAL_TAIL_LINES = 20
-
-    @staticmethod
-    def _is_subagent_source(source: object) -> bool:
-        if isinstance(source, dict):
-            return "subagent" in source
-        if isinstance(source, str):
-            return source == "subagent"
-        return False
-
-    def _meta_session_id(self, payload: dict[str, Any], *, cwd: str) -> str | None:
-        if payload.get("originator") != "codex-tui" or payload.get("cwd") != cwd:
-            return None
-        if self._is_subagent_source(payload.get("source")):
-            return None
-        session_id = payload.get("id")
-        return session_id if isinstance(session_id, str) and session_id else None
 
     @staticmethod
     def _command_from_exec_payload(payload: dict[str, Any]) -> str | None:
@@ -328,236 +232,6 @@ class CodexAdapter:
                 return ExecParseResult([])
 
         return ExecParseResult([])
-
-    def build_tui_start(
-        self, *, cwd: str, model: str | None = None, mcp_config: str | None = None
-    ) -> list[str]:
-        cmd = [
-            *_codex_tui_prefix(),
-            self.binary(),
-            *build_codex_mcp_config_args(mcp_config, ignore_user_config=False),
-            "--no-alt-screen",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--cd",
-            cwd,
-        ]
-        if model:
-            cmd.extend(["--model", model])
-        return cmd
-
-    def build_tui_resume(
-        self,
-        *,
-        cwd: str,
-        session_id: str,
-        model: str | None = None,
-        mcp_config: str | None = None,
-    ) -> list[str]:
-        cmd = [
-            *_codex_tui_prefix(),
-            self.binary(),
-            "resume",
-            *build_codex_mcp_config_args(mcp_config, ignore_user_config=False),
-            session_id,
-            "--no-alt-screen",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--cd",
-            cwd,
-        ]
-        if model:
-            cmd.extend(["--model", model])
-        return cmd
-
-    def parse_tui_event(self, raw: str) -> TuiParseResult:
-        data = _load_json(raw)
-        if data is None:
-            return TuiParseResult([])
-
-        event_type = data.get("type")
-        payload = data.get("payload")
-        if event_type == "session_meta" and isinstance(payload, dict):
-            session_id = payload.get("id")
-            return TuiParseResult(
-                [],
-                session_id=session_id if isinstance(session_id, str) else None,
-            )
-
-        if event_type == "event_msg" and isinstance(payload, dict):
-            ptype = payload.get("type")
-            if ptype == "agent_message":
-                message = payload.get("message")
-                if not isinstance(message, str) or not message:
-                    return TuiParseResult([])
-                if payload.get("phase") == "final_answer":
-                    return TuiParseResult([StreamEvent("result_message", message)])
-                return TuiParseResult([StreamEvent("text", message)])
-            if ptype == "exec_command_end":
-                exit_code = payload.get("exit_code")
-                if not isinstance(exit_code, int) or exit_code == 0:
-                    return TuiParseResult([])
-
-                command = self._command_from_exec_payload(payload)
-                status = _tool_status(
-                    "Bash",
-                    {"command": command} if isinstance(command, str) else None,
-                )
-                return TuiParseResult([StreamEvent("status", f"{status} (exit {exit_code})")])
-            if ptype == "task_complete":
-                return TuiParseResult([StreamEvent("result", "")], done=True)
-
-        if (
-            event_type == "response_item"
-            and isinstance(payload, dict)
-            and payload.get("type") == "function_call"
-        ):
-            name = payload.get("name", "")
-            args = payload.get("arguments")
-            tool_input: dict[str, object] | None = None
-            if isinstance(args, str):
-                parsed_args = _load_json(args)
-                tool_input = parsed_args if parsed_args is not None else None
-            elif isinstance(args, dict):
-                tool_input = args
-            status = self._status_for_codex_function_call(str(name), tool_input)
-            return TuiParseResult([StreamEvent("status", status)])
-
-        # Assistant response_item messages are intentionally ignored:
-        # Codex also emits event_msg agent_message for commentary/final answers,
-        # and that path is the single delivery source to avoid duplicates.
-
-        return TuiParseResult([])
-
-    def is_prompt_ready(self, pane: str) -> bool:
-        return "\u203a" in pane
-
-    def is_modal_present(self, pane: str) -> bool:
-        # Codex leaves prior dialogs in scrollback after they are dismissed.
-        # Trim physical blank padding and inspect only the live tail, otherwise
-        # old "trust this directory" or normal output mentioning settings.json
-        # produces repeated false modal alerts while the agent is simply working.
-        lines = pane.splitlines()
-        while lines and not lines[-1].strip():
-            lines.pop()
-        tail = "\n".join(lines[-self._MODAL_TAIL_LINES :]).lower()
-        markers = (
-            "allow command",
-            "approval required",
-            "do you trust the contents of this directory",
-            "select model and effort",
-            "press enter to confirm",
-            "press enter to continue",
-            "press enter to select",
-            "enter to confirm",
-            "esc to cancel",
-            "esc to dismiss",
-            "no, quit",
-            # Codex Question dialog (multi-choice with optional notes).
-            # Footer: `tab to add notes | enter to submit answer | esc to interrupt`.
-            # Without these markers the bot saw codex's interactive picker as
-            # plain idle pane and never surfaced the TUI keyboard, so the user
-            # could not answer the question from Telegram (reported 2026-04-26).
-            "enter to submit answer",
-            "tab to add notes",
-        )
-        return any(marker in tail for marker in markers)
-
-    def transcript_path_for_state(
-        self, *, cwd: str, session_id: str, transcript_path: str | None
-    ) -> Path | None:
-        if transcript_path:
-            path = Path(transcript_path)
-            return path if path.exists() else None
-        return self.find_tui_transcript(cwd=cwd, session_id=session_id)
-
-    def find_tui_transcript(
-        self, *, cwd: str, session_id: str, home: Path | None = None
-    ) -> Path | None:
-        """Find one existing Codex TUI transcript for ``session_id`` and ``cwd``.
-
-        Collisions fail closed: returning None is safer than tailing an
-        arbitrary transcript from a different run.
-        """
-        home = home or Path.home()
-        root = home / ".codex" / "sessions"
-        matches: list[Path] = []
-        for path in root.glob(f"**/*{session_id}*.jsonl"):
-            try:
-                first = path.read_text(errors="replace").splitlines()[0]
-                data = _load_json(first)
-            except (OSError, IndexError):
-                continue
-            if not data or data.get("type") != "session_meta":
-                continue
-            payload = data.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            if self._meta_session_id(payload, cwd=cwd) == session_id:
-                matches.append(path.resolve())
-        if len(matches) == 1:
-            return matches[0]
-        return None
-
-    async def locate_tui_transcript(
-        self,
-        *,
-        cwd: str,
-        existing: set[Path],
-        since_wall_time: float,
-        home: Path | None = None,
-        timeout_sec: float = 30.0,
-    ) -> TuiSessionInfo:
-        home = home or Path.home()
-        root = home / ".codex" / "sessions"
-        deadline = time.monotonic() + timeout_sec
-        last_candidates: list[tuple[str, str, object, Path]] = []
-        while time.monotonic() < deadline:
-            candidates: list[TuiSessionInfo] = []
-            candidate_meta: list[tuple[str, str, object, Path]] = []
-            for path in root.glob("**/*.jsonl"):
-                if path in existing:
-                    continue
-                try:
-                    if path.stat().st_mtime < since_wall_time:
-                        continue
-                    first = path.read_text(errors="replace").splitlines()[0]
-                    data = _load_json(first)
-                except (OSError, IndexError):
-                    continue
-                if not data or data.get("type") != "session_meta":
-                    continue
-                payload = data.get("payload")
-                if not isinstance(payload, dict):
-                    continue
-                session_id = self._meta_session_id(payload, cwd=cwd)
-                if isinstance(session_id, str):
-                    candidates.append(TuiSessionInfo(session_id, path.resolve()))
-                    candidate_meta.append(
-                        (
-                            session_id,
-                            str(payload.get("cwd")),
-                            payload.get("source"),
-                            path.resolve(),
-                        )
-                    )
-            last_candidates = candidate_meta
-            if len(candidates) == 1:
-                return candidates[0]
-            if len(candidates) > 1:
-                logger.warning(
-                    "Codex TUI transcript collision for cwd=%s candidates=%s",
-                    cwd,
-                    candidate_meta,
-                )
-                raise RuntimeError("Codex TUI transcript collision")
-            await asyncio.sleep(0.2)
-        logger.warning(
-            "Codex TUI transcript not found for cwd=%s since=%s existing=%d candidates=%s",
-            cwd,
-            since_wall_time,
-            len(existing),
-            last_candidates,
-        )
-        raise TimeoutError("Codex TUI transcript not found")
 
 
 CODEX_ADAPTER = CodexAdapter()
