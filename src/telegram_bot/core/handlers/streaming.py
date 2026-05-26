@@ -22,6 +22,7 @@ from telegram_bot.core.messages import t
 from telegram_bot.core.services.claude import SessionManager, StreamEvent
 from telegram_bot.core.services.live_buffer import LiveStatusBuffer
 from telegram_bot.core.services.providers import choose_available_engine, engine_display_name
+from telegram_bot.core.services.session_backend import BackendDispatcher, SessionBackend
 from telegram_bot.core.services.telegram_utils import send_html_with_fallback
 from telegram_bot.core.services.tmux_manager import TmuxManager
 from telegram_bot.core.services.topic_config import StreamMode, TopicConfig
@@ -83,6 +84,26 @@ async def dispatch_image_event(
         caption=caption,
         message_thread_id=thread_id,
     )
+
+
+def _backend_for(
+    dispatcher: BackendDispatcher,
+    topic_config: TopicConfig | None,
+    channel_key: ChannelKey,
+) -> SessionBackend:
+    """Resolve the right SessionBackend for *channel_key* via the topic's engine.
+
+    Falls back to ``"claude"`` when no thread_id (private chat) or when no
+    topic_config is wired in — matches the historical default before codex
+    routing existed.
+    """
+    chat_id, thread_id = channel_key
+    del chat_id
+    if topic_config is not None and thread_id is not None:
+        engine = topic_config.get_topic(thread_id).engine
+    else:
+        engine = "claude"
+    return dispatcher.for_engine(engine)
 
 
 # Default when topic_config is not wired in (standalone / legacy tests).
@@ -593,6 +614,7 @@ async def send_streaming_response(
     git_sync: Any | None = None,
     tmux_manager: TmuxManager | None = None,
     topic_config: TopicConfig | None = None,
+    dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Send prompt to CC with streaming and deliver response to user.
 
@@ -606,6 +628,18 @@ async def send_streaming_response(
                 ``LiveStatusBuffer`` message; falls back to verbose behaviour
                 for status when no buffer is available.
     All message IDs are still recorded for reply-to-resume.
+
+    ``dispatcher`` (optional during the Phase 10/11 transition) routes
+    per-channel session methods (``is_active`` / ``send_stream`` /
+    ``get_session_id``) to the engine-appropriate backend — TmuxManager for
+    claude, CodexSessionManager for codex. When omitted, we fall back to
+    ``tmux_manager`` so legacy call-sites (notably ``__main__.py`` until
+    Phase 11) keep working.
+
+    ``tmux_manager`` is still required separately because tmux-only / shared
+    infra (live_buffer wiring, get_session_snapshot, set_buffer / get_buffer)
+    has no codex equivalent yet. TODO: once those getters move to a shared
+    place, drop the ``tmux_manager`` parameter.
     """
     stream_mode = _resolve_stream_mode(topic_config, channel_key)
     # User-content preview — DEBUG only to keep INFO journalctl clean of PII.
@@ -616,6 +650,15 @@ async def send_streaming_response(
         prompt,
     )
 
+    # Resolve the engine-appropriate backend once for the per-channel session
+    # methods used below. When ``dispatcher`` is not wired in yet (transition),
+    # fall back to ``tmux_manager`` — which is still the claude backend.
+    backend: SessionBackend | None
+    if dispatcher is not None:
+        backend = _backend_for(dispatcher, topic_config, channel_key)
+    else:
+        backend = tmux_manager
+
     sent_message_ids: list[int] = []
 
     cmd = prompt.split()[0] if prompt.startswith("/") else None
@@ -623,7 +666,7 @@ async def send_streaming_response(
     thinking_msg = await message.answer(thinking_text, disable_notification=True)
     sent_message_ids.append(thinking_msg.message_id)
 
-    used_tmux = tmux_manager is not None and tmux_manager.is_active(channel_key)
+    used_tmux = backend is not None and backend.is_active(channel_key)
 
     # Materialize a LiveStatusBuffer for live-mode. For tmux it's registered
     # on the manager so on_event (which may fire from a long-running tail)
@@ -773,10 +816,10 @@ async def send_streaming_response(
 
     try:
         if used_tmux:
-            assert tmux_manager is not None
-            response = await tmux_manager.send_stream(channel_key, prompt, on_event)
+            assert backend is not None
+            response = await backend.send_stream(channel_key, prompt, on_event)
             # Sync session_id back so reply-to-resume works
-            new_sid = tmux_manager.get_session_id(channel_key)
+            new_sid = backend.get_session_id(channel_key)
             if new_sid:
                 await session_manager.override_session(channel_key, new_sid)
         else:
