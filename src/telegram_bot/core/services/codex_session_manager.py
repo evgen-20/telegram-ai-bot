@@ -39,7 +39,38 @@ from telegram_bot.core.types import ChannelKey
 
 logger = logging.getLogger("codex_session_manager")
 
-DEFAULT_PROXY_COMMAND: tuple[str, ...] = ("codex", "app-server", "proxy")
+# NOTE: the plan/spec named this DEFAULT_PROXY_COMMAND because it originally
+# spawned ``codex app-server proxy``, which forwards raw bytes to the daemon's
+# unix-socket control endpoint. That endpoint is WebSocket-upgraded (see
+# codex-rs/app-server-transport/src/transport/unix_socket.rs), so a line-based
+# JSON-RPC client cannot talk to it. The ``--listen stdio://`` transport, by
+# contrast, is plain line-delimited JSON (see transport/stdio.rs) and matches
+# our ``CodexAppServerClient``. We therefore spawn a per-session app-server
+# directly. This keeps the per-session-subprocess design intact; only the
+# transport changes. The legacy "DEFAULT_PROXY_COMMAND" name is retained so
+# existing tests / callers that import it keep working.
+DEFAULT_PROXY_COMMAND: tuple[str, ...] = ("codex", "app-server", "--listen", "stdio://")
+
+
+def _extract_thread_id(ts: Any) -> str:
+    """Pull the thread id out of a ``thread/start`` response.
+
+    Real codex (>= 0.133) wraps the new thread in a ``thread`` object whose
+    ``id`` is the canonical identifier (see
+    ``docs/codex-protocol/schemas/v2/ThreadStartResponse.json``). The plan
+    used ``threadId`` directly, which only matched older snapshots. Accept
+    both shapes for resilience.
+    """
+    thread = ts.get("thread")
+    if isinstance(thread, dict):
+        tid = thread.get("id")
+        if isinstance(tid, str):
+            return tid
+    legacy = ts.get("threadId")
+    if isinstance(legacy, str):
+        return legacy
+    raise KeyError(f"thread/start response missing thread id: {ts!r}")
+
 
 # How long a single turn is allowed to run before we give up and call
 # ``turn/interrupt``. Mirrors the tmux backend's per-turn budget.
@@ -471,10 +502,10 @@ class CodexSessionManager:
                         exc_info=True,
                     )
                     ts = await client.thread_start(cwd=cwd, model=model)
-                    thread_id = ts["threadId"]
+                    thread_id = _extract_thread_id(ts)
             else:
                 ts = await client.thread_start(cwd=cwd, model=model)
-                thread_id = ts["threadId"]
+                thread_id = _extract_thread_id(ts)
         except Exception:
             with contextlib.suppress(Exception):
                 await client.close()

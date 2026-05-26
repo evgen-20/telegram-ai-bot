@@ -123,7 +123,10 @@ async def test_auto_approve_exec_command_approval() -> None:
     stderr_bytes += await client._proc.stderr.read()
     stderr = stderr_bytes.decode()
 
-    assert '"decision": "approve"' in stderr or '"decision":"approve"' in stderr
+    # The fixture asks ``execCommandApproval``; per the v2 schema, that
+    # response uses ``allow``/``deny`` (not ``approve``). See
+    # docs/codex-protocol/schemas/ExecCommandApprovalResponse.json.
+    assert '"decision": "allow"' in stderr or '"decision":"allow"' in stderr
     # The approval response must reference the original server request id.
     assert '"id": 100' in stderr or '"id":100' in stderr
 

@@ -37,12 +37,17 @@ async def test_ensure_running_when_socket_exists() -> None:
 
 @pytest.mark.asyncio
 async def test_ensure_running_spawns_when_socket_missing() -> None:
+    """The manager attempts to spawn a daemon when the socket is missing,
+    but tolerates the spawn never producing one — sessions still work via
+    ``codex app-server --listen stdio://`` per-session (see
+    CodexSessionManager.DEFAULT_PROXY_COMMAND for the rationale).
+    """
     with tempfile.TemporaryDirectory() as tmp:
         sock_path = Path(tmp) / "missing.sock"
         mgr = CodexDaemonManager(socket_path=sock_path, start_command=["true"])
         with patch.object(mgr, "_spawn_daemon", new_callable=AsyncMock) as spawn:
-            # _wait_for_socket returns False (we never create the socket),
-            # so ensure_running should raise after the timeout.
-            with pytest.raises(RuntimeError, match="daemon did not appear"):
-                await mgr.ensure_running(timeout_sec=0.5)
+            # _wait_for_socket returns False (we never create the socket).
+            # ensure_running now logs a warning and returns instead of raising;
+            # the daemon is no longer a hard prerequisite.
+            await mgr.ensure_running(timeout_sec=0.5)
             spawn.assert_called_once()

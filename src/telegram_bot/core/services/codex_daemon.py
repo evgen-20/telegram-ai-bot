@@ -45,13 +45,33 @@ class CodexDaemonManager:
             return False
 
     async def ensure_running(self, timeout_sec: float = 10.0) -> None:
+        """Best-effort: start the singleton daemon if it isn't already up.
+
+        Historical note: the original spec assumed every session spoke to the
+        daemon via ``codex app-server proxy``. In practice that proxy forwards
+        raw bytes to a WebSocket-upgraded control socket, which our
+        line-based JSON-RPC client cannot use. The session manager now
+        spawns ``codex app-server --listen stdio://`` per session, so the
+        daemon is not strictly required. We still attempt to start it (cheap
+        on standalone installs, no-op when already up) but tolerate failure
+        so the bot still works on hosts where the standalone install isn't
+        present.
+        """
         if self.is_running():
             return
-        logger.info("starting codex app-server daemon")
-        await self._spawn_daemon()
+        logger.info("starting codex app-server daemon (best-effort)")
+        try:
+            await self._spawn_daemon()
+        except Exception:
+            logger.warning(
+                "codex daemon spawn failed; sessions still work via stdio", exc_info=True
+            )
+            return
         if not await self._wait_for_socket(timeout_sec):
-            raise RuntimeError(
-                f"codex daemon did not appear at {self._socket_path} within {timeout_sec}s"
+            logger.warning(
+                "codex daemon did not appear at %s within %ss; sessions still work via stdio",
+                self._socket_path,
+                timeout_sec,
             )
 
     async def _spawn_daemon(self) -> None:

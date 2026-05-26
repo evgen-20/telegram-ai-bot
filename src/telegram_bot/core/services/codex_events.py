@@ -106,19 +106,27 @@ def _parse_item_completed(params: dict[str, Any]) -> list[StreamEvent]:
         return []
 
     if kind == "imageGeneration":
-        if item.get("status") == "completed":
-            saved = item.get("savedPath")
-            caption = item.get("revisedPrompt")
-            if isinstance(saved, str) and saved:
-                return [
-                    StreamEvent(
-                        "image_message",
-                        saved,
-                        caption if isinstance(caption, str) else None,
-                    )
-                ]
-            return []
-        err = str(item.get("error") or "unknown")
-        return [StreamEvent("status", f"Image generation failed: {err}")]
+        # The real codex schema (codex-rs/app-server-protocol/src/protocol/v2/item.rs)
+        # types ``status`` as a free-form String. The TUI replay path ignores
+        # ``status`` entirely and routes on ``savedPath`` instead, so we do the
+        # same: presence of a usable ``savedPath`` means we have a renderable
+        # image, regardless of how the server tagged the status (observed
+        # values during smoke 12.2: not the literal "completed").
+        saved = item.get("savedPath")
+        caption = item.get("revisedPrompt")
+        if isinstance(saved, str) and saved:
+            return [
+                StreamEvent(
+                    "image_message",
+                    saved,
+                    caption if isinstance(caption, str) else None,
+                )
+            ]
+        # No saved path: only treat as a failure if the server told us so.
+        status = item.get("status")
+        if isinstance(status, str) and status.lower() in {"failed", "error", "errored"}:
+            err = str(item.get("error") or status)
+            return [StreamEvent("status", f"Image generation failed: {err}")]
+        return []
 
     return []

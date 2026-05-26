@@ -20,7 +20,6 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from telegram_bot.core.services.codex_protocol import (
-    ApprovalResponse,
     InitializeResult,
     ThreadStartResponse,
 )
@@ -29,12 +28,28 @@ logger = logging.getLogger("codex_app_server")
 
 _APPROVAL_METHODS: frozenset[str] = frozenset(
     {
+        # Legacy method names (kept for older codex versions and tests).
         "execCommandApproval",
         "applyPatchApproval",
         "commandExecutionRequestApproval",
         "fileChangeRequestApproval",
+        # Codex >= 0.133 namespaces approval requests under the item that
+        # needs approval (observed during smoke 12.2).
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "item/applyPatch/requestApproval",
+        "item/execCommand/requestApproval",
+        # Permission profile / sandbox escapes from app-server-protocol.
+        "permissionsRequestApproval",
     }
 )
+
+# asyncio.StreamReader's default readline buffer is 64 KiB; image-generation
+# notifications can carry large base64 payloads that easily blow past it
+# (observed during smoke 12.2 — "Separator is not found, and chunk exceed
+# the limit"). 8 MiB is large enough for any single JSON-line frame we have
+# seen in practice while still bounding memory.
+_READLINE_LIMIT = 8 * 1024 * 1024
 
 
 class CodexAppServerClient:
@@ -72,7 +87,18 @@ class CodexAppServerClient:
         return result  # type: ignore[return-value]
 
     async def thread_start(self, *, cwd: str, model: str | None) -> ThreadStartResponse:
-        params: dict[str, Any] = {"cwd": cwd}
+        # The bot historically runs codex with
+        # ``--dangerously-bypass-approvals-and-sandbox``; the equivalent over
+        # app-server is sandbox=danger-full-access + approvalPolicy=never. The
+        # default (read-only + on-request) makes the agent refuse to write
+        # files and is unusable for the bot's main workflow (observed in
+        # smoke 12.2: "I couldn't create or run hello.py because the
+        # workspace is read-only").
+        params: dict[str, Any] = {
+            "cwd": cwd,
+            "sandbox": "danger-full-access",
+            "approvalPolicy": "never",
+        }
         if model is not None:
             params["model"] = model
         result = await self._request("thread/start", params)
@@ -82,8 +108,18 @@ class CodexAppServerClient:
         await self._request("thread/resume", {"threadId": thread_id})
 
     async def turn_start(self, *, thread_id: str, prompt: str) -> None:
-        # Fire-and-forget: response is delivered via notifications.
-        await self._request("turn/start", {"threadId": thread_id, "prompt": prompt})
+        # Fire-and-forget: response is delivered via notifications. The
+        # ``input`` shape is an array of ``UserInput`` items (see
+        # ``docs/codex-protocol/schemas/v2/TurnStartParams.json``). The plan
+        # used a flat ``prompt`` string, which the server now rejects with
+        # "missing field `input`".
+        await self._request(
+            "turn/start",
+            {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt}],
+            },
+        )
 
     async def turn_interrupt(self, *, thread_id: str, turn_id: str) -> None:
         await self._request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
@@ -103,12 +139,19 @@ class CodexAppServerClient:
     # ---- internals ------------------------------------------------------
 
     async def _spawn(self) -> None:
-        self._proc = await asyncio.create_subprocess_exec(
+        # Bypass asyncio's default 64 KiB readline limit so image-generation
+        # frames don't trip ``LimitOverrunError`` (see ``_READLINE_LIMIT``).
+        # ``create_subprocess_exec`` doesn't accept ``limit``, so we drop down
+        # to the lower-level helpers that do.
+        loop = asyncio.get_running_loop()
+        transport, protocol = await loop.subprocess_exec(
+            lambda: asyncio.subprocess.SubprocessStreamProtocol(limit=_READLINE_LIMIT, loop=loop),
             *self._command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        self._proc = asyncio.subprocess.Process(transport, protocol, loop)
         self._read_task = asyncio.create_task(self._read_loop(), name="codex_read_loop")
 
     async def _read_loop(self) -> None:
@@ -158,7 +201,12 @@ class CodexAppServerClient:
         method = msg["method"]
         request_id = msg["id"]
         if method in _APPROVAL_METHODS:
-            response: ApprovalResponse = {"decision": "approve"}
+            # Different approval methods use different "decision" shapes (see
+            # docs/codex-protocol/schemas/*ApprovalResponse.json). Pick the
+            # approve-ish value per method so the agent isn't blocked when an
+            # approval slips past the ``approvalPolicy: never`` thread setting.
+            decision = _approval_decision_for(method)
+            response: dict[str, Any] = {"decision": decision}
             await self._send({"jsonrpc": "2.0", "id": request_id, "result": response})
             return
         # Unknown server request: respond with error.
@@ -206,3 +254,26 @@ class CodexRpcError(RuntimeError):
 
 class CodexEofError(RuntimeError):
     """The codex subprocess closed stdout."""
+
+
+def _approval_decision_for(method: str) -> str:
+    """Return the approve-ish ``decision`` string codex expects per method.
+
+    The smoke run surfaced an ``item/commandExecution/requestApproval`` request
+    whose response schema (``CommandExecutionRequestApprovalResponse.json``)
+    enumerates ``accept`` / ``acceptForSession`` / ``decline`` / ``cancel``.
+    The older ``ExecCommandApproval`` family uses ``allow``/``deny``;
+    permissions approvals use ``read``/``write``. Until we surface approvals
+    to the Telegram user, auto-accept whatever the host needs.
+    """
+    # Approvals that grew their own per-item method names in 0.133 use the
+    # CommandExecutionApprovalDecision/FileChangeApprovalDecision shape.
+    if method.startswith("item/") or method in {
+        "commandExecutionRequestApproval",
+        "fileChangeRequestApproval",
+    }:
+        return "accept"
+    if method == "permissionsRequestApproval":
+        return "write"
+    # Legacy execCommandApproval / applyPatchApproval.
+    return "allow"
