@@ -55,6 +55,19 @@ __all__ = [
 
 
 _MAX_PHOTO_BYTES = 10 * 1024 * 1024
+# Telegram's hard limit on photo/document captions. Going over raises
+# Bad Request: message caption is too long. Codex's revisedPrompt regularly
+# exceeds this for detailed prompts.
+_MAX_CAPTION_CHARS = 1024
+
+
+def _truncate_caption(caption: str | None) -> str | None:
+    if caption is None:
+        return None
+    if len(caption) <= _MAX_CAPTION_CHARS:
+        return caption
+    ellipsis = "…"
+    return caption[: _MAX_CAPTION_CHARS - len(ellipsis)] + ellipsis
 
 
 async def dispatch_image_event(
@@ -68,7 +81,7 @@ async def dispatch_image_event(
     path = Path(event.content)
     if not path.exists():
         return
-    caption = event.session_id  # repurposed field for image_message
+    caption = _truncate_caption(event.session_id)  # session_id reused as caption
     size = path.stat().st_size
     if size <= _MAX_PHOTO_BYTES:
         await bot.send_photo(

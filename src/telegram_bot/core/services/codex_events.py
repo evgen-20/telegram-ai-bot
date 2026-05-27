@@ -45,8 +45,20 @@ def parse_codex_notification(notif: dict[str, Any]) -> list[StreamEvent]:
         return [StreamEvent("result", "")]
 
     if method == "error":
-        msg = str(params.get("message") or "Codex error")
-        return [StreamEvent("result_message", f"Codex error: {msg}")]
+        # ErrorNotification shape (v2): {error: TurnError, threadId, turnId,
+        # willRetry}. The user-readable text lives at ``error.message``, with
+        # an optional ``codexErrorInfo`` code (e.g. "usageLimitExceeded").
+        # When ``willRetry`` is true codex will try again on its own — we
+        # suppress the intermediate noise and only surface the terminal
+        # error (willRetry=false) to the user.
+        if params.get("willRetry") is True:
+            return []
+        err = params.get("error") or {}
+        text = err.get("message") if isinstance(err, dict) else None
+        if not isinstance(text, str) or not text:
+            # Older snapshots put the message at the top level; keep working.
+            text = str(params.get("message") or "unknown")
+        return [StreamEvent("result_message", f"Codex error: {text}")]
 
     if method not in _WARNED_METHODS:
         _WARNED_METHODS.add(method)

@@ -80,3 +80,45 @@ def test_turn_completed_emits_result_sentinel() -> None:
 def test_unknown_method_returns_empty() -> None:
     events = parse_codex_notification(_notif("totally/made/up"))
     assert events == []
+
+
+def test_error_with_will_retry_is_suppressed() -> None:
+    # Codex emits intermediate errors with willRetry=true while it retries
+    # internally (e.g. image-gen rate limit + retry). Surfacing each as a
+    # user-facing message is just noise.
+    events = parse_codex_notification(
+        _notif(
+            "error",
+            threadId="t",
+            turnId="x",
+            willRetry=True,
+            error={"message": "rate limited"},
+        )
+    )
+    assert events == []
+
+
+def test_error_terminal_surfaces_real_message() -> None:
+    # Real ErrorNotification puts the message at params.error.message
+    # (not params.message). Earlier code defaulted to "Codex error" and the
+    # user saw "Codex error: Codex error" — useless. Extract the real text.
+    events = parse_codex_notification(
+        _notif(
+            "error",
+            threadId="t",
+            turnId="x",
+            willRetry=False,
+            error={"message": "Usage limit exceeded"},
+        )
+    )
+    assert [(e.type, e.content) for e in events] == [
+        ("result_message", "Codex error: Usage limit exceeded")
+    ]
+
+
+def test_error_legacy_top_level_message() -> None:
+    # If a server build still puts the message at the top level, accept it.
+    events = parse_codex_notification(_notif("error", willRetry=False, message="something broke"))
+    assert [(e.type, e.content) for e in events] == [
+        ("result_message", "Codex error: something broke")
+    ]
