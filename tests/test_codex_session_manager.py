@@ -358,7 +358,15 @@ async def test_send_stream_emits_image_message(daemon_mock: AsyncMock, tmp_path:
     )
     await mgr.send_stream(ch, "draw a cat", on_event)
 
-    assert any(e.type == "image_message" and e.content == str(img) for e in captured)
+    # Race fix: the manager snapshots the file to a bot-owned tmp dir before
+    # the agent can move it. Event content points at the snapshot (not the
+    # original), but it must still exist on disk and match the original bytes.
+    images = [e for e in captured if e.type == "image_message"]
+    assert len(images) == 1
+    snap = Path(images[0].content)
+    assert snap.exists()
+    assert snap != img  # rewritten to bot-owned location
+    assert snap.read_bytes() == img.read_bytes()
 
 
 @pytest.mark.asyncio

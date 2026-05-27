@@ -21,6 +21,9 @@ import asyncio
 import contextlib
 import json
 import logging
+import shutil
+import tempfile
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,6 +53,43 @@ logger = logging.getLogger("codex_session_manager")
 # transport changes. The legacy "DEFAULT_PROXY_COMMAND" name is retained so
 # existing tests / callers that import it keep working.
 DEFAULT_PROXY_COMMAND: tuple[str, ...] = ("codex", "app-server", "--listen", "stdio://")
+
+
+_IMAGE_SNAPSHOT_DIR = Path(tempfile.gettempdir()) / "codex-bot-imgs"
+
+
+def _snapshot_image_in_place(notif: dict[str, Any]) -> None:
+    """Win the race against codex moving/deleting freshly-generated images.
+
+    If ``notif`` is an ``item/completed`` for ``imageGeneration`` with a
+    ``savedPath``, copy that file to a bot-owned tmp location synchronously
+    and rewrite ``savedPath`` in-place to point at the copy. Called from the
+    JSON-RPC read-loop callback so it runs before the agent can issue any
+    subsequent ``mv`` / ``rm`` command for the original file.
+
+    Best-effort: any failure leaves ``notif`` untouched and the downstream
+    handler will simply find the original path missing and silently skip.
+    """
+    if notif.get("method") != "item/completed":
+        return
+    params = notif.get("params") or {}
+    item = params.get("item") or {}
+    if not isinstance(item, dict) or item.get("type") != "imageGeneration":
+        return
+    saved_raw = item.get("savedPath")
+    if not isinstance(saved_raw, str) or not saved_raw:
+        return
+    src = Path(saved_raw)
+    try:
+        if not src.exists():
+            return
+        _IMAGE_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        suffix = src.suffix or ".png"
+        dst = _IMAGE_SNAPSHOT_DIR / f"{uuid.uuid4().hex}{suffix}"
+        shutil.copy2(src, dst)
+        item["savedPath"] = str(dst)
+    except OSError:
+        logger.warning("failed to snapshot codex image %s", src, exc_info=True)
 
 
 def _extract_thread_id(ts: Any) -> str:
@@ -494,6 +534,13 @@ class CodexSessionManager:
         notif_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
         async def on_notification(notif: dict[str, Any]) -> None:
+            # Race fix: codex may move/rename the generated image immediately
+            # after emitting item/completed. Snapshot to a bot-owned tmp file
+            # synchronously inside the read-loop callback, before any later
+            # mv/rm command from the agent can run, then rewrite savedPath in
+            # the notification so the downstream parser hands the bot's copy
+            # to dispatch_image_event.
+            _snapshot_image_in_place(notif)
             await notif_queue.put(notif)
 
         client = self._client_factory(
