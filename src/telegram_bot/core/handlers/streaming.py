@@ -8,11 +8,13 @@ import html
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from aiogram import Bot
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import Message
+from aiogram.types import FSInputFile, Message
 from aiogram.utils.text_decorations import HtmlDecoration
 
 from telegram_bot.core.keyboards import topic_keyboard
@@ -20,6 +22,7 @@ from telegram_bot.core.messages import t
 from telegram_bot.core.services.claude import SessionManager, StreamEvent
 from telegram_bot.core.services.live_buffer import LiveStatusBuffer
 from telegram_bot.core.services.providers import choose_available_engine, engine_display_name
+from telegram_bot.core.services.session_backend import BackendDispatcher, SessionBackend
 from telegram_bot.core.services.telegram_utils import send_html_with_fallback
 from telegram_bot.core.services.tmux_manager import TmuxManager
 from telegram_bot.core.services.topic_config import StreamMode, TopicConfig
@@ -39,6 +42,7 @@ __all__ = [
     "_markdown_to_html_parts",
     "_smart_escape",
     "build_reply_context",
+    "dispatch_image_event",
     "ensure_exec_mode_ready",
     "inject_reply_context",
     "markdown_to_html",
@@ -48,6 +52,72 @@ __all__ = [
     "send_to_tmux_if_active",
     "split_html_message",
 ]
+
+
+_MAX_PHOTO_BYTES = 10 * 1024 * 1024
+# Telegram's hard limit on photo/document captions. Going over raises
+# Bad Request: message caption is too long. Codex's revisedPrompt regularly
+# exceeds this for detailed prompts.
+_MAX_CAPTION_CHARS = 1024
+
+
+def _truncate_caption(caption: str | None) -> str | None:
+    if caption is None:
+        return None
+    if len(caption) <= _MAX_CAPTION_CHARS:
+        return caption
+    ellipsis = "…"
+    return caption[: _MAX_CAPTION_CHARS - len(ellipsis)] + ellipsis
+
+
+async def dispatch_image_event(
+    *,
+    bot: Bot,
+    chat_id: int,
+    thread_id: int | None,
+    event: StreamEvent,
+) -> None:
+    """Send an image_message StreamEvent as a Telegram photo (or document fallback)."""
+    path = Path(event.content)
+    if not path.exists():
+        return
+    caption = _truncate_caption(event.session_id)  # session_id reused as caption
+    size = path.stat().st_size
+    if size <= _MAX_PHOTO_BYTES:
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=FSInputFile(str(path)),
+            caption=caption,
+            message_thread_id=thread_id,
+        )
+        return
+    await bot.send_document(
+        chat_id=chat_id,
+        document=FSInputFile(str(path)),
+        caption=caption,
+        message_thread_id=thread_id,
+    )
+
+
+def _backend_for(
+    dispatcher: BackendDispatcher,
+    topic_config: TopicConfig | None,
+    channel_key: ChannelKey,
+) -> SessionBackend:
+    """Resolve the right SessionBackend for *channel_key* via the topic's engine.
+
+    Falls back to ``"claude"`` when no thread_id (private chat) or when no
+    topic_config is wired in — matches the historical default before codex
+    routing existed.
+    """
+    chat_id, thread_id = channel_key
+    del chat_id
+    if topic_config is not None and thread_id is not None:
+        engine = topic_config.get_topic(thread_id).engine
+    else:
+        engine = "claude"
+    return dispatcher.for_engine(engine)
+
 
 # Default when topic_config is not wired in (standalone / legacy tests).
 # "verbose" preserves pre-Wave-2 behavior: every status becomes its own message.
@@ -125,25 +195,39 @@ async def send_to_tmux_if_active(
     prompt: str,
     source_msg: Message,
     tmux_manager: TmuxManager,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> bool:
-    """Send prompt directly to tmux CC stdin if a tail is active.
+    """Send prompt directly to the active backend's stdin if a tail is active.
 
-    Returns True if dispatched to tmux (caller should return immediately),
-    False if not in active tmux tail (caller should enqueue normally).
+    Returns True if dispatched to the backend (caller should return immediately),
+    False if not in active tail (caller should enqueue normally).
 
     Always creates a new "Thinking..." placeholder and rotates the live
-    buffer, even when CC is already processing — so status events for
-    subsequent prompts appear in a fresh message rather than the original.
-    N rapid messages produce N placeholders; each idles until CC reaches it.
+    buffer, even when the backend is already processing — so status events
+    for subsequent prompts appear in a fresh message rather than the
+    original. N rapid messages produce N placeholders; each idles until the
+    backend reaches it.
+
+    Per-channel methods (``is_active`` / ``is_tailing`` / ``send_direct`` /
+    ``close_buffer``) route through ``backend_dispatcher`` when supplied so
+    codex topics talk to ``CodexSessionManager``. ``tmux_manager`` is still
+    used for shared infra (``live_buffer_available`` / ``get_live_bot`` /
+    ``set_buffer`` / ``get_topic_config``) which has no codex equivalent.
     """
+    topic_config = tmux_manager.get_topic_config()
+    backend: SessionBackend | TmuxManager
+    if backend_dispatcher is not None:
+        backend = _backend_for(backend_dispatcher, topic_config, key)  # type: ignore[arg-type]
+    else:
+        backend = tmux_manager
     msg_id = source_msg.message_id
-    if not (tmux_manager.is_active(key) and tmux_manager.is_tailing(key)):
+    if not (backend.is_active(key) and backend.is_tailing(key)):
         logger.info(
             "MSG_TRACE send_to_tmux_if_active skip channel=%s msg=%d active=%s tailing=%s",
             key,
             msg_id,
-            tmux_manager.is_active(key),
-            tmux_manager.is_tailing(key),
+            backend.is_active(key),
+            backend.is_tailing(key),
         )
         return False
     logger.info(
@@ -154,10 +238,7 @@ async def send_to_tmux_if_active(
 
     # Resolve stream_mode for this channel from topic_config on tmux_manager
     # (wired at startup). Missing wiring → legacy verbose behavior.
-    stream_mode = _resolve_stream_mode(
-        tmux_manager.get_topic_config(),  # type: ignore[arg-type]
-        key,
-    )
+    stream_mode = _resolve_stream_mode(topic_config, key)  # type: ignore[arg-type]
 
     cmd = prompt.split()[0] if prompt.startswith("/") else None
     thinking_text = t("ui.running_command", command=cmd) if cmd else t("ui.thinking")
@@ -175,7 +256,7 @@ async def send_to_tmux_if_active(
         # set_buffer closes the previous buffer atomically, covering the prior thinking page.
         await tmux_manager.set_buffer(key, new_buffer)
 
-    delivered = await tmux_manager.send_direct(key, prompt)
+    delivered = await backend.send_direct(key, prompt)
     if not delivered:
         # Modal-blocked or send-keys failure: the thinking placeholder is
         # a lie (CC never received the prompt). Roll back both the
@@ -186,7 +267,7 @@ async def send_to_tmux_if_active(
         # spawns for that next attempt.
         with contextlib.suppress(TelegramAPIError):
             await thinking_msg.delete()
-        await tmux_manager.close_buffer(key)
+        await backend.close_buffer(key)
     return True
 
 
@@ -199,6 +280,7 @@ async def ensure_exec_mode_ready(
     tmux_manager: TmuxManager,
     session_manager: SessionManager,
     source_msg: Message,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> bool:
     """Idempotent lazy-start for tmux mode. Returns False only on RuntimeError.
 
@@ -220,6 +302,11 @@ async def ensure_exec_mode_ready(
     and returns True.
     """
     msg_id = source_msg.message_id
+    backend: SessionBackend | TmuxManager
+    if backend_dispatcher is not None:
+        backend = _backend_for(backend_dispatcher, topic_config, key)
+    else:
+        backend = tmux_manager
     lock = _lazy_start_locks.setdefault(key, asyncio.Lock())
     waiting = lock.locked()
     if waiting:
@@ -229,7 +316,7 @@ async def ensure_exec_mode_ready(
             msg_id,
         )
     async with lock:
-        if tmux_manager.is_active(key):
+        if backend.is_active(key):
             logger.info(
                 "MSG_TRACE ensure_exec_mode_ready already_active channel=%s msg=%d",
                 key,
@@ -304,7 +391,7 @@ async def ensure_exec_mode_ready(
         # a proper fix (pid→sessionId pointer via ~/.claude/sessions/<pid>.json)
         # is tracked separately.
         try:
-            await tmux_manager.start_session(
+            await backend.start_session(
                 key,
                 mode=mode,
                 cwd=cwd,
@@ -557,6 +644,8 @@ async def send_streaming_response(
     git_sync: Any | None = None,
     tmux_manager: TmuxManager | None = None,
     topic_config: TopicConfig | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
+    attachments: list[Path] | None = None,
 ) -> None:
     """Send prompt to CC with streaming and deliver response to user.
 
@@ -570,6 +659,18 @@ async def send_streaming_response(
                 ``LiveStatusBuffer`` message; falls back to verbose behaviour
                 for status when no buffer is available.
     All message IDs are still recorded for reply-to-resume.
+
+    ``backend_dispatcher`` (optional during the Phase 10/11 transition) routes
+    per-channel session methods (``is_active`` / ``send_stream`` /
+    ``get_session_id``) to the engine-appropriate backend — TmuxManager for
+    claude, CodexSessionManager for codex. When omitted, we fall back to
+    ``tmux_manager`` so legacy call-sites (notably ``__main__.py`` until
+    Phase 11) keep working.
+
+    ``tmux_manager`` is still required separately because tmux-only / shared
+    infra (live_buffer wiring, get_session_snapshot, set_buffer / get_buffer)
+    has no codex equivalent yet. TODO: once those getters move to a shared
+    place, drop the ``tmux_manager`` parameter.
     """
     stream_mode = _resolve_stream_mode(topic_config, channel_key)
     # User-content preview — DEBUG only to keep INFO journalctl clean of PII.
@@ -580,6 +681,16 @@ async def send_streaming_response(
         prompt,
     )
 
+    # Resolve the engine-appropriate backend once for the per-channel session
+    # methods used below. When ``backend_dispatcher`` is not wired in yet
+    # (transition), fall back to ``tmux_manager`` — which is still the claude
+    # backend.
+    backend: SessionBackend | None
+    if backend_dispatcher is not None:
+        backend = _backend_for(backend_dispatcher, topic_config, channel_key)
+    else:
+        backend = tmux_manager
+
     sent_message_ids: list[int] = []
 
     cmd = prompt.split()[0] if prompt.startswith("/") else None
@@ -587,7 +698,7 @@ async def send_streaming_response(
     thinking_msg = await message.answer(thinking_text, disable_notification=True)
     sent_message_ids.append(thinking_msg.message_id)
 
-    used_tmux = tmux_manager is not None and tmux_manager.is_active(channel_key)
+    used_tmux = backend is not None and backend.is_active(channel_key)
 
     # Materialize a LiveStatusBuffer for live-mode. For tmux it's registered
     # on the manager so on_event (which may fire from a long-running tail)
@@ -681,6 +792,21 @@ async def send_streaming_response(
             logger.debug("Dropping empty %s event on channel %s", event.type, ctx.channel_key)
             return
 
+        # image_message events bypass stream-mode routing — they're media,
+        # not text, so they're delivered identically in verbose/live/minimal.
+        if event.type == "image_message":
+            if message.bot is not None:
+                try:
+                    await dispatch_image_event(
+                        bot=message.bot,
+                        chat_id=message.chat.id,
+                        thread_id=channel_key[1],
+                        event=event,
+                    )
+                except TelegramAPIError:
+                    logger.exception("Failed to deliver image_message on channel %s", channel_key)
+            return
+
         # Mode-specific early drops / routing done before dispatch so the
         # per-mode handlers stay flat and uniform.
         if ctx.stream_mode == "minimal" and event.type == "status":
@@ -722,10 +848,12 @@ async def send_streaming_response(
 
     try:
         if used_tmux:
-            assert tmux_manager is not None
-            response = await tmux_manager.send_stream(channel_key, prompt, on_event)
+            assert backend is not None
+            response = await backend.send_stream(
+                channel_key, prompt, on_event, attachments=attachments
+            )
             # Sync session_id back so reply-to-resume works
-            new_sid = tmux_manager.get_session_id(channel_key)
+            new_sid = backend.get_session_id(channel_key)
             if new_sid:
                 await session_manager.override_session(channel_key, new_sid)
         else:
@@ -734,6 +862,7 @@ async def send_streaming_response(
                 prompt,
                 on_event,
                 on_engine_changed=_notify_engine_changed,
+                attachments=attachments,
             )
     except asyncio.CancelledError:
         # Status messages ARE the history — no cleanup needed

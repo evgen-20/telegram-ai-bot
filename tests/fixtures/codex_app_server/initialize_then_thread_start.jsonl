@@ -1,0 +1,6 @@
+{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"codex","version":"0.133.0"},"capabilities":{}}}
+{"jsonrpc":"2.0","id":2,"result":{"threadId":"thread-deadbeef"}}
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-deadbeef","turnId":"turn-1"}}
+{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-deadbeef","itemId":"item-1","delta":"Hello"}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-deadbeef","item":{"id":"item-1","type":"agentMessage","text":"Hello","phase":"final_answer","status":"completed"}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-deadbeef","turnId":"turn-1","status":"completed"}}

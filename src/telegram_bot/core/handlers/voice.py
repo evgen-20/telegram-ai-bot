@@ -19,6 +19,7 @@ from telegram_bot.core.handlers.streaming import (
 from telegram_bot.core.messages import t
 from telegram_bot.core.services.claude import SessionManager
 from telegram_bot.core.services.message_queue import MessageQueue
+from telegram_bot.core.services.session_backend import BackendDispatcher
 from telegram_bot.core.services.tmux_manager import TmuxManager
 from telegram_bot.core.services.topic_config import TopicConfig
 from telegram_bot.core.services.transcriber import Transcriber
@@ -43,6 +44,7 @@ async def handle_voice(
     tmux_manager: TmuxManager,
     topic_config: TopicConfig,
     inbox_reply_handler: Callable[[Message, MessageQueue], Awaitable[bool]] | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     key = channel_key(message)
     logger.debug("Voice message from user %s", message.from_user and message.from_user.id)
@@ -94,12 +96,19 @@ async def handle_voice(
             return
 
         if not await ensure_exec_mode_ready(
-            key, topic_config, tmux_manager, session_manager, last_voice_msg
+            key,
+            topic_config,
+            tmux_manager,
+            session_manager,
+            last_voice_msg,
+            backend_dispatcher,
         ):
             return
 
         # Tmux with active tail: send directly to CC stdin, bypass queue.
-        if await send_to_tmux_if_active(key, prompt, last_voice_msg, tmux_manager):
+        if await send_to_tmux_if_active(
+            key, prompt, last_voice_msg, tmux_manager, backend_dispatcher
+        ):
             return
 
         target_session_id = resolve_reply_target(last_voice_msg, session_manager)
@@ -111,6 +120,8 @@ async def handle_voice(
             tmux_manager,
             target_session_id=target_session_id,
             inject_reply_if_no_target=True,
+            backend_dispatcher=backend_dispatcher,
+            topic_config=topic_config,
         )
 
     forward_batcher.add_voice(key, message, recognizing_msg, on_voice_batch)

@@ -24,15 +24,37 @@ create a cycle.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from aiogram.types import Message
 
 from telegram_bot.core.handlers.streaming import build_reply_context, inject_reply_context
 from telegram_bot.core.services.message_queue import MessageQueue
+from telegram_bot.core.services.session_backend import BackendDispatcher, SessionBackend
 from telegram_bot.core.services.tmux_manager import TmuxManager
+from telegram_bot.core.services.topic_config import TopicConfig
 from telegram_bot.core.types import ChannelKey
 
 logger = logging.getLogger(__name__)
+
+
+def _backend_for(
+    dispatcher: BackendDispatcher,
+    topic_config: TopicConfig | None,
+    channel_key: ChannelKey,
+) -> SessionBackend:
+    """Resolve the engine-appropriate ``SessionBackend`` for *channel_key*.
+
+    Falls back to ``"claude"`` when no thread_id (private chat) or when no
+    topic_config was supplied — matches the historical default before codex
+    routing existed.
+    """
+    _, thread_id = channel_key
+    if topic_config is not None and thread_id is not None:
+        engine = topic_config.get_topic(thread_id).engine
+    else:
+        engine = "claude"
+    return dispatcher.for_engine(engine)
 
 
 def enqueue_prompt(
@@ -44,6 +66,9 @@ def enqueue_prompt(
     *,
     target_session_id: str | None,
     inject_reply_if_no_target: bool,
+    backend_dispatcher: BackendDispatcher | None = None,
+    topic_config: TopicConfig | None = None,
+    attachments: list[Path] | None = None,
 ) -> None:
     """Final enqueue step shared by text/voice/photo/forward handlers.
 
@@ -54,10 +79,12 @@ def enqueue_prompt(
     - forward.py passes `inject_reply_if_no_target=False`: forwarded batches
       already carry their own structure; injecting a reply quote would
       duplicate the user's intent.
-    - Always enqueues with `suppress_notification=tmux_manager.is_active(key)`
+    - Always enqueues with `suppress_notification=<backend>.is_active(key)`
       because in tmux mode the CC TUI provides its own position feedback
       (thinking placeholder, live buffer) — the queue's "added to position N"
-      message is redundant.
+      message is redundant. ``backend_dispatcher`` (optional during the Phase
+      10/11 transition) selects the engine-appropriate backend; when omitted
+      we fall back to ``tmux_manager`` (the claude-only legacy path).
     """
     if target_session_id is None and inject_reply_if_no_target:
         reply_context = build_reply_context(source_msg)
@@ -70,11 +97,17 @@ def enqueue_prompt(
         len(prompt),
         target_session_id,
     )
+    backend: SessionBackend | TmuxManager
+    if backend_dispatcher is not None:
+        backend = _backend_for(backend_dispatcher, topic_config, key)
+    else:
+        backend = tmux_manager
     message_queue.enqueue(
         key,
         prompt,
         source_msg.message_id,
         source_msg,
         target_session_id=target_session_id,
-        suppress_notification=tmux_manager.is_active(key),
+        suppress_notification=backend.is_active(key),
+        attachments=attachments,
     )

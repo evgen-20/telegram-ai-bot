@@ -233,9 +233,14 @@ def _agent_done_status(description: str) -> str:
 
 @dataclass
 class StreamEvent:
-    """One event from CC stream."""
+    """One event from a Claude/Codex agent stream.
 
-    type: Literal["status", "text", "result", "result_message"]
+    `image_message` carries a local filesystem path in `content` (so the
+    Telegram handler can call `sendPhoto`); `session_id` is repurposed
+    as the caption when the type is `image_message`.
+    """
+
+    type: Literal["status", "text", "result", "result_message", "image_message"]
     content: str
     session_id: str | None = None
 

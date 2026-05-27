@@ -28,7 +28,10 @@ from telegram_bot.core.messages import t
 from telegram_bot.core.middleware.auth import AuthMiddleware
 from telegram_bot.core.services.bot_commands import setup_bot_commands
 from telegram_bot.core.services.claude import SessionManager
+from telegram_bot.core.services.codex_daemon import CodexDaemonManager
+from telegram_bot.core.services.codex_session_manager import CodexSessionManager
 from telegram_bot.core.services.message_queue import MessageQueue
+from telegram_bot.core.services.session_backend import BackendDispatcher
 from telegram_bot.core.services.tmux_manager import TmuxManager
 from telegram_bot.core.services.topic_config import TopicConfig
 from telegram_bot.core.services.transcriber import Transcriber
@@ -42,10 +45,13 @@ async def process_queue_item(
     prompt: str,
     source_messages: list[Message],
     target_session_id: str | None,
+    attachments: list[Path],
     *,
     bot: Bot,
     session_manager: SessionManager,
     tmux_manager: TmuxManager,
+    topic_config: TopicConfig | None = None,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Send a queued prompt to CC; on session change, notify the user."""
     old_session_id = session_manager.get_current_session_id(channel_key)
@@ -79,7 +85,14 @@ async def process_queue_item(
     if reply_message is None:
         return
     await send_streaming_response(
-        reply_message, session_manager, channel_key, prompt, tmux_manager=tmux_manager
+        reply_message,
+        session_manager,
+        channel_key,
+        prompt,
+        tmux_manager=tmux_manager,
+        topic_config=topic_config,
+        backend_dispatcher=backend_dispatcher,
+        attachments=attachments,
     )
 
 
@@ -103,24 +116,39 @@ async def _start() -> None:
     )
     tmux_manager.wire_live_buffer(bot=bot, topic_config=topic_config)
     tmux_manager.restore_all()
+
+    # Codex backend shares the same on-disk state file as the tmux backend so
+    # `codex_sessions` and the tmux sessions live side-by-side in state.json.
+    codex_daemon = CodexDaemonManager()
+    codex_manager = CodexSessionManager(
+        daemon=codex_daemon,
+        state_path=tmux_manager._state_path,
+    )
+    codex_manager.restore_all()
+    dispatcher = BackendDispatcher(claude=tmux_manager, codex=codex_manager)
+
     session_manager = SessionManager(settings, topic_config=topic_config)
     transcriber = Transcriber(settings)
-    forward_batcher = ForwardBatcher(bot=bot)
+    forward_batcher = ForwardBatcher(bot=bot, transcriber=transcriber)
 
     async def _process_queue_item(
         channel_key: ChannelKey,
         prompt: str,
         source_messages: list[Message],
         target_session_id: str | None,
+        attachments: list[Path],
     ) -> None:
         await process_queue_item(
             channel_key,
             prompt,
             source_messages,
             target_session_id,
+            attachments,
             bot=bot,
             session_manager=session_manager,
             tmux_manager=tmux_manager,
+            topic_config=topic_config,
+            backend_dispatcher=dispatcher,
         )
 
     message_queue = MessageQueue(bot, session_manager, _process_queue_item)
@@ -152,6 +180,7 @@ async def _start() -> None:
     dp["settings"] = settings
     dp["topic_config"] = topic_config
     dp["tmux_manager"] = tmux_manager
+    dp["backend_dispatcher"] = dispatcher
 
     ensure_tmp_dir(session_manager.file_cache_dir)
     cleanup_old_tmp_files(session_manager.file_cache_dir)
