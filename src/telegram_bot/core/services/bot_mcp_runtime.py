@@ -16,6 +16,12 @@ logger = logging.getLogger(__name__)
 _RUNTIME_FILE_MODE = 0o600
 _RUNTIME_DIR_MODE = 0o700
 
+# Root of the bot repo (…/telegram-ai-agent). The `mcp-servers/bot` runtime,
+# the token-bearing `.env`, and `.venv` all live here — NOT in the per-topic
+# session cwd. Anchoring to the module location keeps the generated MCP config
+# valid for topics whose cwd differs from the repo (cwd=null, project topics).
+_BOT_REPO_ROOT = Path(__file__).resolve().parents[4]
+
 
 def default_bot_mcp_config(project_root: str | Path) -> Path:
     """Return the default bot MCP config path for a project root."""
@@ -33,11 +39,13 @@ def _load_mcp_config(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {"mcpServers": {}}
 
 
-def _standard_bot_server(project_root: Path) -> dict[str, Any]:
+def _standard_bot_server(_project_root: Path) -> dict[str, Any]:
+    # The bot MCP runtime lives in the repo, not the session cwd; ignore the
+    # per-topic project_root and anchor to the repo so start.sh/.env/.venv resolve.
     return {
         "command": "bash",
-        "args": [str(project_root / "mcp-servers" / "bot" / "start.sh")],
-        "env": {"PROJECT_DIR": str(project_root)},
+        "args": [str(_BOT_REPO_ROOT / "mcp-servers" / "bot" / "start.sh")],
+        "env": {"PROJECT_DIR": str(_BOT_REPO_ROOT)},
     }
 
 
@@ -90,7 +98,7 @@ def ensure_bot_runtime_mcp_config(
     bot_server = dict(raw_bot) if isinstance(raw_bot, dict) else _standard_bot_server(root)
     raw_env = bot_server.get("env")
     env = dict(raw_env) if isinstance(raw_env, dict) else {}
-    env.setdefault("PROJECT_DIR", str(root))
+    env["PROJECT_DIR"] = str(_BOT_REPO_ROOT)
     env["TELEGRAM_CHAT_ID"] = str(channel_key[0])
     env["TELEGRAM_THREAD_ID"] = "" if channel_key[1] is None else str(channel_key[1])
     env["TELEGRAM_CONTEXT_LOCK"] = "1"
