@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from telegram_bot.core.services import codex_session_manager
 from telegram_bot.core.services.cc_events import StreamEvent
 from telegram_bot.core.services.codex_daemon import CodexDaemonManager
 from telegram_bot.core.services.codex_session_manager import CodexSessionManager
@@ -664,3 +665,89 @@ async def test_restore_all_then_send_stream_lazy_reconnect(
     assert daemon_mock.ensure_running.await_count >= 1
     # The turn completed via the scripted notification.
     assert any(e.type == "result" for e in captured)
+
+
+async def test_send_stream_recycles_client_on_turn_timeout(
+    daemon_mock: AsyncMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn that goes silent must drop the client, not wedge the channel.
+
+    Regression: a codex app-server that stopped emitting notifications kept
+    being reused, so every later message burned _TURN_TIMEOUT_SEC in silence
+    and the chat was stuck on the "Thinking…" placeholder forever.
+    """
+    monkeypatch.setattr(codex_session_manager, "_TURN_TIMEOUT_SEC", 0.05)
+
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps({"codex_sessions": {"-400:9": {"thread_id": "th-wedged", "cwd": "/tmp"}}})
+    )
+
+    spawned: list[SilentClient] = []
+    resume_calls: list[str] = []
+
+    class SilentClient:
+        def __init__(
+            self,
+            *,
+            command: list[str],
+            on_notification: Callable[[dict[str, Any]], Awaitable[None] | None],
+        ) -> None:
+            self._on_notification = on_notification
+            self.closed = False
+            self.interrupts: list[str] = []
+            spawned.append(self)
+
+        async def __aenter__(self) -> SilentClient:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            await self.close()
+
+        async def initialize(self, *, client_name: str, client_version: str) -> dict[str, Any]:
+            return {"serverInfo": {}}
+
+        async def thread_start(self, *, cwd: str, model: str | None) -> dict[str, Any]:
+            return {"threadId": "unused"}
+
+        async def thread_resume(self, *, thread_id: str) -> None:
+            resume_calls.append(thread_id)
+
+        async def turn_start(
+            self, *, thread_id: str, prompt: str, attachments: list[str] | None = None
+        ) -> None:
+            return None  # accepted, then silence — the wedged app-server case
+
+        async def turn_interrupt(self, *, thread_id: str, turn_id: str) -> None:
+            self.interrupts.append(turn_id)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    mgr = CodexSessionManager(
+        daemon=daemon_mock,
+        state_path=state_path,
+        proxy_command_factory=lambda: ["bash", "-c", "cat"],
+    )
+    mgr._client_factory = SilentClient  # type: ignore[assignment]
+    mgr.restore_all()
+
+    ch = (-400, 9)
+    captured: list[StreamEvent] = []
+
+    async def on_event(ev: StreamEvent) -> None:
+        captured.append(ev)
+
+    await mgr.send_stream(ch, "first message", on_event)
+
+    assert len(spawned) == 1
+    assert spawned[0].closed is True
+    assert mgr._sessions[ch].client is None
+    assert mgr._sessions[ch].thread_id == "th-wedged"
+    # The user is told what happened instead of staring at a silent placeholder.
+    assert any(e.type == "result_message" for e in captured)
+
+    # The next message reconnects to the same thread on a fresh client.
+    await mgr.send_stream(ch, "second message", on_event)
+    assert len(spawned) == 2
+    assert resume_calls == ["th-wedged", "th-wedged"]

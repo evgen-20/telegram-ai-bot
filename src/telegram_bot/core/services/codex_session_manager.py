@@ -303,12 +303,32 @@ class CodexSessionManager:
                 try:
                     notif = await asyncio.wait_for(notif_queue.get(), timeout=_TURN_TIMEOUT_SEC)
                 except TimeoutError:
-                    logger.warning("codex turn timeout for %s; interrupting", channel_key)
+                    logger.warning(
+                        "codex turn timeout for %s; interrupting and recycling client",
+                        channel_key,
+                    )
                     if state.current_turn_id is not None:
                         with contextlib.suppress(Exception):
                             await client.turn_interrupt(
                                 thread_id=thread_id, turn_id=state.current_turn_id
                             )
+                    # An app-server that goes silent mid-turn stays silent: every
+                    # later turn/start is accepted and then dropped, so each new
+                    # message burns another _TURN_TIMEOUT_SEC with nothing but a
+                    # "Thinking…" placeholder in the chat. Drop the client here —
+                    # the reconnect branch above respawns it and resumes the same
+                    # thread on the next message.
+                    await self._recycle_client(state)
+                    ret = on_event(
+                        StreamEvent(
+                            "result_message",
+                            "⚠️ Codex не ответил за "
+                            f"{int(_TURN_TIMEOUT_SEC // 60)} мин — сессия перезапущена. "
+                            "Повтори запрос.",
+                        )
+                    )
+                    if asyncio.iscoroutine(ret):
+                        await ret
                     break
 
                 if notif.get("method") == "turn/started":
@@ -331,6 +351,22 @@ class CodexSessionManager:
             state.is_processing = False
             state.current_turn_id = None
         return ""
+
+    async def _recycle_client(self, state: CodexSessionState) -> None:
+        """Tear down a wedged client so the next send reconnects to the thread.
+
+        ``thread_id`` and ``cwd`` are kept, so the reconnect path in
+        ``send_stream`` resumes the same codex thread rather than losing
+        history.
+        """
+        client = state.client
+        state.client = None
+        # Fresh queue so notifications buffered by the dead client cannot leak
+        # into the next turn; the reconnect path replaces it again anyway.
+        state.notif_queue = asyncio.Queue()
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.close()
 
     async def send_direct(self, channel_key: ChannelKey, prompt: str) -> bool:
         """Non-streaming send: drain the turn and report success."""
