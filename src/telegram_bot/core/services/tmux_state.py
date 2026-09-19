@@ -28,6 +28,10 @@ from telegram_bot.core.types import ChannelKey
 
 logger = logging.getLogger(__name__)
 
+# Top-level state.json keys that belong to a writer other than StateStore.
+# `StateStore.save()` must preserve them verbatim instead of dropping them.
+_FOREIGN_STATE_KEYS: tuple[str, ...] = ("codex_sessions",)
+
 
 @dataclass(frozen=True, slots=True)
 class CodexSessionRecord:
@@ -157,8 +161,18 @@ class StateStore:
 
         `sessions` is typed loosely because ChannelKey is a tuple and
         cannot be a dict key in JSON — we serialise "chat_id:thread_id".
+
+        Top-level keys owned by other writers (currently `codex_sessions`,
+        written by `CodexSessionManager._persist`) are carried over from the
+        file on disk. Rebuilding `data` from scratch used to clobber them, so
+        any tmux save silently wiped every persisted codex thread mapping and
+        codex topics came back from a restart with no thread to resume.
         """
         data: dict[str, Any] = {}
+        on_disk = self.load_raw()
+        for reserved_key in _FOREIGN_STATE_KEYS:
+            if reserved_key in on_disk:
+                data[reserved_key] = on_disk[reserved_key]
         for channel_key, state in sessions.items():
             key_str = f"{channel_key[0]}:{channel_key[1]}"
             data[key_str] = asdict(state)

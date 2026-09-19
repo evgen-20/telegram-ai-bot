@@ -7,6 +7,8 @@ from pathlib import Path
 
 from telegram_bot.core.services.tmux_state import (
     CodexSessionRecord,
+    StateStore,
+    TmuxSessionState,
     load_codex_sessions,
 )
 
@@ -79,3 +81,63 @@ def test_malformed_entries_skipped(tmp_path: Path) -> None:
     records = load_codex_sessions(sp)
     # Only the valid one survives.
     assert records == {(-1, 5): CodexSessionRecord(thread_id="ok", cwd="/a")}
+
+
+def test_tmux_save_preserves_codex_sessions(tmp_path: Path) -> None:
+    """A tmux state save must not wipe the codex_sessions key.
+
+    Regression: StateStore.save() rebuilt the file from the tmux sessions
+    dict alone, so every save clobbered the codex thread mapping written by
+    CodexSessionManager._persist and codex topics lost their thread on the
+    next bot restart.
+    """
+    sp = tmp_path / "state.json"
+    sp.write_text(
+        json.dumps(
+            {
+                "codex_sessions": {
+                    "-1001:42": {"thread_id": "th-keep", "cwd": "/home/x"},
+                }
+            }
+        )
+    )
+
+    store = StateStore(sp)
+    store.save(
+        {
+            (-1001, 7): TmuxSessionState(
+                session_name="cc-1001-7",
+                session_dir=str(tmp_path / "sess"),
+                session_id="sid-1",
+                mode="free",
+                cwd="/home/x",
+                mcp_config="/tmp/mcp.json",
+                chat_id=-1001,
+            )
+        }
+    )
+
+    raw = json.loads(sp.read_text())
+    assert "-1001:7" in raw
+    assert load_codex_sessions(sp) == {
+        (-1001, 42): CodexSessionRecord(thread_id="th-keep", cwd="/home/x"),
+    }
+
+
+def test_tmux_save_without_codex_sessions_writes_no_key(tmp_path: Path) -> None:
+    """No codex sessions on disk → no empty placeholder key is invented."""
+    sp = tmp_path / "state.json"
+    StateStore(sp).save(
+        {
+            (-1001, 7): TmuxSessionState(
+                session_name="cc-1001-7",
+                session_dir=str(tmp_path / "sess"),
+                session_id="sid-1",
+                mode="free",
+                cwd="/home/x",
+                mcp_config="/tmp/mcp.json",
+                chat_id=-1001,
+            )
+        }
+    )
+    assert "codex_sessions" not in json.loads(sp.read_text())
