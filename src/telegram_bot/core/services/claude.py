@@ -372,6 +372,7 @@ class SessionManager:
                 await asyncio.wait_for(process.wait(), timeout=5)
             except TimeoutError:
                 logger.warning("process.wait() timed out 5s after SIGKILL for pgid %d", pgid)
+            _close_subprocess_transport(process)
         except OSError:
             # Orphaned CC process is a real operational signal — INFO, not
             # DEBUG. "Already exited" is the benign common case; a persistent
@@ -1690,6 +1691,22 @@ class SessionManager:
 
         self._sessions.clear()
         logger.info("All sessions shut down")
+
+
+def _close_subprocess_transport(process: asyncio.subprocess.Process) -> None:
+    """Close a reaped subprocess's transport while the loop is still alive.
+
+    Waiting on the child does not close the transport's pipes — that is left
+    to ``BaseSubprocessTransport.__del__`` at GC time. During shutdown the GC
+    runs after the event loop is closed, so its ``call_soon`` raises
+    "RuntimeError: Event loop is closed", printed as an ignored exception with
+    a traceback. Harmless, but it buries real errors in the shutdown log.
+    """
+    transport = getattr(process, "_transport", None)
+    if transport is None:
+        return
+    with contextlib.suppress(Exception):
+        transport.close()
 
 
 class CCNotFoundError(Exception):

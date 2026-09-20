@@ -33,7 +33,10 @@ from telegram_bot.core.types import ChannelKey
 logger = logging.getLogger(__name__)
 
 # Top-level state.json keys that belong to a writer other than StateStore.
-# `StateStore.save()` must preserve them verbatim instead of dropping them.
+# `StateStore.save()` preserves them on its own (it merges into the on-disk
+# dict), but readers that treat every top-level key as a "chat_id:thread_id"
+# channel key — `tmux_recovery.restore_all` — have to skip them explicitly.
+_FOREIGN_STATE_KEYS: tuple[str, ...] = ("codex_sessions",)
 
 
 @dataclass(frozen=True, slots=True)

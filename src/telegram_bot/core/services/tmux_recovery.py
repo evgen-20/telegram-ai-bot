@@ -21,7 +21,11 @@ from telegram_bot.core.services.tmux_spawn import (
     spawn_tmux_sync,
     tmux_pane_inherits_disallowed_environment,
 )
-from telegram_bot.core.services.tmux_state import TmuxSessionState, parse_state_entry
+from telegram_bot.core.services.tmux_state import (
+    _FOREIGN_STATE_KEYS,
+    TmuxSessionState,
+    parse_state_entry,
+)
 from telegram_bot.core.types import ChannelKey
 
 
@@ -181,6 +185,12 @@ def restore_all(
 
     restored: dict[ChannelKey, TmuxSessionState] = {}
     for key_str, data in raw.items():
+        # state.json is shared: besides "chat_id:thread_id" entries it carries
+        # top-level keys owned by other writers (`codex_sessions`). They are
+        # not channel keys, so splitting them raises and every boot logged a
+        # traceback. `StateStore.save()` already preserves them; skip here.
+        if key_str in _FOREIGN_STATE_KEYS:
+            continue
         try:
             chat_id_str, thread_str = key_str.split(":", 1)
             channel_key: ChannelKey = (

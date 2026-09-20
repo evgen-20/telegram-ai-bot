@@ -14,6 +14,7 @@ responsible for re-issuing `thread/resume` after reconnect (handled by
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -62,6 +63,7 @@ class CodexAppServerClient:
         self._command = command
         self._on_notification = on_notification
         self._proc: asyncio.subprocess.Process | None = None
+        self._transport: asyncio.SubprocessTransport | None = None
         self._read_task: asyncio.Task[None] | None = None
         self._pending: dict[int | str, asyncio.Future[dict[str, Any]]] = {}
         self._next_id = 0
@@ -151,6 +153,15 @@ class CodexAppServerClient:
             except TimeoutError:
                 self._proc.kill()
                 await self._proc.wait()
+        # Reaping the child does not close the transport's pipes — that is
+        # left to ``BaseSubprocessTransport.__del__``, which runs at GC time.
+        # On shutdown that is after the event loop is gone, and its
+        # ``call_soon`` raises "Event loop is closed" as an ignored exception.
+        # Close it here, while the loop is still running.
+        if self._transport is not None:
+            with contextlib.suppress(Exception):
+                self._transport.close()
+            self._transport = None
 
     # ---- internals ------------------------------------------------------
 
@@ -167,6 +178,7 @@ class CodexAppServerClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        self._transport = transport
         self._proc = asyncio.subprocess.Process(transport, protocol, loop)
         self._read_task = asyncio.create_task(self._read_loop(), name="codex_read_loop")
 
