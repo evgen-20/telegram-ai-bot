@@ -12,6 +12,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
 
 from telegram_bot.core.config import get_settings
+from telegram_bot.core.handlers.audio import router as audio_router
 from telegram_bot.core.handlers.cancel import router as cancel_router
 from telegram_bot.core.handlers.commands import router as commands_router
 from telegram_bot.core.handlers.forum_topic import router as forum_topic_router
@@ -169,6 +170,7 @@ async def _start() -> None:
     dp.include_router(mode_router)
     dp.include_router(forward_router)
     dp.include_router(voice_router)
+    dp.include_router(audio_router)
     dp.include_router(photo_router)
     dp.include_router(text_router)
 

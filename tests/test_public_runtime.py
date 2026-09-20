@@ -12,6 +12,7 @@ from telegram_bot.core.services.bot_commands import build_bot_commands
 from telegram_bot.core.services.claude import SessionManager
 from telegram_bot.core.services.providers import CODEX_ADAPTER, choose_available_engine
 from telegram_bot.core.services.topic_config import TopicConfig
+from telegram_bot.core.tui import capture
 
 
 def test_public_settings_default_cwd_is_generic(monkeypatch) -> None:
@@ -167,3 +168,83 @@ def test_mcp_bot_server_imports() -> None:
     assert hasattr(module, "send_image")
     assert hasattr(module, "send_document")
     assert not hasattr(module, "send_file")
+
+
+# Verbatim CC 2.1.259 trust dialog (pane width 200, captured 2026-09-19).
+TRUST_PANE = """\
+ Accessing workspace:
+ /home/evgen/projects/tg-bot
+ Quick safety check: Is this a project you created or one you trust?
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to cancel
+"""
+
+READY_PANE = """\
+❯ Try "edit tail.py to..."
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+"""
+
+
+def test_trust_dialog_is_not_mistaken_for_a_ready_prompt() -> None:
+    assert capture.is_trust_dialog(TRUST_PANE)
+    assert not capture.is_prompt_ready(TRUST_PANE)
+    assert capture.is_prompt_ready(READY_PANE)
+
+
+def test_trust_accept_keys_walk_onto_the_affirmative_option() -> None:
+    # Cursor sits on "No, exit" — a bare Enter would quit the CLI.
+    assert capture.trust_accept_keys(TRUST_PANE) == ["Down", "Enter"]
+
+
+def test_trust_accept_keys_confirm_in_place_when_yes_is_selected() -> None:
+    pane = TRUST_PANE.replace(" ❯ No, exit", "   No, exit").replace(
+        "   Yes, I trust", " ❯ Yes, I trust"
+    )
+    assert capture.trust_accept_keys(pane) == ["Enter"]
+
+
+def test_trust_accept_keys_send_nothing_on_unknown_layout() -> None:
+    assert capture.trust_accept_keys("Do you trust the contents of this directory?") is None
+
+
+async def test_await_prompt_ready_retries_trust_accept_until_input_lands(monkeypatch) -> None:
+    """The TUI swallows keys for the first seconds — one attempt is not enough."""
+    sent: list[list[str]] = []
+    captures = 0
+
+    def fake_capture(_session_name: str) -> str:
+        nonlocal captures
+        captures += 1
+        return TRUST_PANE if captures <= 6 else READY_PANE
+
+    # 1s per clock read, so the 2s retry cadence fires on every other poll.
+    ticks = iter(range(500))
+    monkeypatch.setattr(capture, "_capture_pane", fake_capture)
+    monkeypatch.setattr(capture, "_send_keys", lambda _name, keys: sent.append(keys))
+    monkeypatch.setattr(capture, "_POLL_INTERVAL_SEC", 0)
+
+    assert await capture.await_prompt_ready("sess", timeout=30.0, clock=lambda: float(next(ticks)))
+    assert len(sent) > 1, "a single swallowed attempt must not be the end of it"
+    assert all(keys == ["Down", "Enter"] for keys in sent), sent
+
+
+async def test_await_prompt_ready_never_blind_enters_a_trust_dialog(monkeypatch) -> None:
+    """A fallback Enter would land on "No, exit" and quit the CLI."""
+    sent: list[list[str]] = []
+    killed: list[str] = []
+
+    ticks = iter(range(500))
+    monkeypatch.setattr(capture, "_capture_pane", lambda _name: TRUST_PANE)
+    monkeypatch.setattr(capture, "_send_keys", lambda _name, keys: sent.append(keys))
+    monkeypatch.setattr(capture, "_kill_session", lambda name: killed.append(name))
+    monkeypatch.setattr(capture, "_POLL_INTERVAL_SEC", 0)
+
+    assert not await capture.await_prompt_ready(
+        "sess", timeout=30.0, clock=lambda: float(next(ticks))
+    )
+    assert killed == ["sess"]
+    assert sent, "trust accept was never attempted"
+    assert all(keys == ["Down", "Enter"] for keys in sent), sent
