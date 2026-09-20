@@ -16,7 +16,11 @@ from typing import TYPE_CHECKING, Any, cast
 from telegram_bot.core.services.bot_mcp_runtime import ensure_bot_runtime_mcp_config
 from telegram_bot.core.services.claude import StreamEvent
 from telegram_bot.core.services.tmux_spawn import file_size, spawn_tmux_sync
-from telegram_bot.core.services.tmux_state import TmuxSessionState, _normalize_state_dict
+from telegram_bot.core.services.tmux_state import (
+    _FOREIGN_STATE_KEYS,
+    TmuxSessionState,
+    _normalize_state_dict,
+)
 from telegram_bot.core.types import ChannelKey
 
 
@@ -113,6 +117,12 @@ def restore_all(
 
     restored: dict[ChannelKey, TmuxSessionState] = {}
     for key_str, data in raw.items():
+        # state.json is shared: besides "chat_id:thread_id" entries it carries
+        # top-level keys owned by other writers (`codex_sessions`). They are
+        # not channel keys, so splitting them raises and every boot logged a
+        # traceback. `StateStore.save()` already preserves them; skip here.
+        if key_str in _FOREIGN_STATE_KEYS:
+            continue
         try:
             chat_id_str, thread_str = key_str.split(":", 1)
             channel_key: ChannelKey = (
