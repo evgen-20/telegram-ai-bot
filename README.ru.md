@@ -22,14 +22,18 @@ CLI на вашем VPS. Он превращает Telegram в удаленны�
 - Выбирать Claude Code или Codex отдельно для каждого топика.
 - Использовать постоянную `tmux`-сессию для полноценной разработки или короткий
   subprocess для простых разовых задач.
-- Отправлять текст, фото, документы, пачки forwarded messages и, опционально,
-  voice messages.
-- Делать свои prompt modes под разные сценарии.
+- Отправлять текст, фото, документы, пачки forwarded messages, Telegram rich
+  messages и, опционально, voice messages.
+- Настраивать bundled example prompt под второй workflow.
 - Открывать live TUI snapshot через `/tui` и нажимать кнопки Enter, Esc,
   стрелки, цифры, refresh и close.
 - Возобновлять старые сессии через reply на сообщения бота или через `/resume`.
-- Давать агенту отправлять сообщения, картинки и документы обратно в Telegram
-  через встроенный bot MCP server.
+- Перезапускать зависший runtime топика через `/recycle` и смотреть состояние
+  MCP runtime processes через `/mcpstatus`.
+- Давать агенту отправлять сообщения, картинки, галереи картинок и документы
+  обратно в Telegram через встроенный bot MCP server.
+- Показывать финальные ответы с Markdown-таблицами как Telegram rich messages,
+  с автоматическим fallback на обычный текст.
 
 ## Как Это Устроено
 
@@ -41,6 +45,24 @@ Telegram - только интерфейс управления. Когда вы
 3. находит настройки текущего чата или forum topic;
 4. отправляет prompt в Claude Code или Codex в нужной рабочей папке;
 5. стримит прогресс и финальный ответ обратно в Telegram.
+
+## Rich Final Answers
+
+Бот умеет читать входящие Telegram rich messages, включая forwarded rich posts.
+Текстовые блоки нормализуются в Markdown-like текст для агента, таблицы и
+сноски остаются видимыми в этом тексте, а rich photo blocks передаются как
+image attachments, если Telegram отдает по ним файлы. Rich media без доступных
+файлов остается явными placeholders.
+
+Промежуточные сообщения всегда отправляются обычными Telegram-сообщениями. Если
+в финальном ответе агента есть Markdown-таблица, бот преобразует этот ответ в
+Telegram rich message blocks и отправляет его через Telegram RichText/RichMessage
+API. Финальные ответы без таблиц остаются обычным текстом. Если Telegram
+отклоняет rich payload или установленная Telegram-библиотека не умеет его
+отправлять, бот делает fallback на обычный текстовый ответ.
+
+Публичная схема Telegram для этой функции начинается здесь:
+https://core.telegram.org/type/RichText.
 
 Forum topics изолированы по Telegram `chat_id` и `thread_id`. У каждого топика
 может быть свой:
@@ -139,12 +161,17 @@ ALLOWED_USER_IDS=[123456789]
 BOT_LANG=ru
 DEEPGRAM_API_KEY=
 PROJECT_ROOT=.
+APP_ROOT=
+AGENT_WORKSPACE_ROOT=
 DEFAULT_CWD=.
 FILE_CACHE_DIR=./data
 TOPIC_CONFIG_PATH=./topic_config.json
 TMUX_SESSIONS_DIR=./tmux_sessions
 CC_MAX_TURNS=100
 CC_INACTIVITY_KILL_SEC=1800
+CODEX_AUTO_UPDATE_ENABLED=true
+CODEX_UPDATE_TIMEOUT_SEC=180
+CODEX_UPDATE_COOLDOWN_SEC=86400
 ```
 
 Пояснения:
@@ -153,8 +180,15 @@ CC_INACTIVITY_KILL_SEC=1800
 - `ALLOWED_USER_IDS`: JSON array Telegram user IDs, которым можно пользоваться
   ботом.
 - `BOT_LANG`: `en` или `ru`. После смены языка перезапустите бота.
+- `PROJECT_ROOT`: стандартный корень единственного checkout. Для обычной
+  установки оставьте `APP_ROOT` и `AGENT_WORKSPACE_ROOT` пустыми.
+- `APP_ROOT` / `AGENT_WORKSPACE_ROOT`: необязательная схема с раздельными
+  каталогами. В первом лежат установленный код и MCP launchers, во втором —
+  редактируемые проекты, topic config, session mappings, tmux state и файлы.
 - `DEFAULT_CWD`: рабочая папка по умолчанию для ненастроенных топиков.
 - `DEEPGRAM_API_KEY`: оставьте пустым, если не нужны voice messages.
+- `CODEX_AUTO_UPDATE_ENABLED`: включает автоматические и ручные обновления
+  Codex. Timeout ограничивает любое обновление, cooldown — только автоматические.
 
 Запустите в foreground:
 
@@ -220,8 +254,7 @@ skill настроить topics.
       "mcp_config": null,
       "stream_mode": "live",
       "exec_mode": "tmux",
-      "engine": "codex",
-      "model": null
+      "engine": "codex"
     }
   }
 }
@@ -238,11 +271,17 @@ skill настроить topics.
 - `stream_mode`: `verbose`, `live` или `minimal`.
 - `exec_mode`: `tmux` или `subprocess`.
 - `engine`: `claude` или `codex`.
-- `model`: опциональный override модели или `null`.
+- `model`: legacy single override модели или `null`.
+- `models`: опциональные per-engine overrides с ключами `claude` и/или
+  `codex`. Порядок выбора: `models[active_engine]`, затем `model`, затем default
+  провайдера; ручной `/engine` сохраняет всю map. При automatic missing-CLI
+  fallback первый запрос использует default нового провайдера, а сохранённый
+  per-engine override применяется со следующего запроса.
 
-Для `cwd` и `mcp_config` используйте absolute paths. Ставьте `mcp_config` в
-`null`, если у вас еще нет настоящего MCP config file для проекта. Не коммитьте
-настоящий `topic_config.json`.
+Для `cwd` и `mcp_config` используйте absolute paths. По умолчанию оставляйте
+`mcp_config` равным `null`. Project MCP config подключайте только после проверки
+на secrets и private dependencies; дополнительные servers имеют собственные
+provider/tool-policy ограничения. Не коммитьте настоящий `topic_config.json`.
 
 ## Prompt Modes
 
@@ -255,11 +294,10 @@ Prompt files лежат в `src/telegram_bot/prompts/`.
   `task-manager.md`.
 
 Для no-code customization отредактируйте или замените `task-manager.md` и
-используйте `"mode": "task"` в нужных topics. Если хотите новое имя mode,
-например `blog`, добавьте prompt file и расширьте runtime tool mapping для
-этого mode в коде; иначе у агента может не быть allowed tool list. Не кладите в
-public repo приватные данные, секреты, личные workflows и реальный customer
-context.
+сохраните `"mode": "task"` в нужных topics. Новый mode name требует изменений
+runtime resolver, явной tool policy и тестов; одного prompt file недостаточно.
+Не кладите в public repo приватные данные, секреты, личные workflows и реальный
+customer context.
 
 ## Execution Modes
 
@@ -280,8 +318,9 @@ context.
 - агент может показывать permission questions или interactive menus;
 - нужны `/resume` и reply-to-session behavior.
 
-`tmux` потребляет ресурсы, пока сессия жива. Когда она больше не нужна,
-используйте `/kill`.
+`tmux` потребляет ресурсы, пока сессия жива. Если runtime топика застрял, но
+resumable context надо сохранить, используйте `/recycle`; когда сессия больше
+не нужна, используйте `/kill`.
 
 ### subprocess
 
@@ -300,10 +339,13 @@ entry.
 
 `/stream` управляет тем, сколько прогресса бот отправляет в Telegram.
 
-- `verbose`: подробный прогресс отдельными сообщениями. Полезно для debugging.
-- `live`: один редактируемый progress message плюс финальный ответ. Лучший
-  default для большинства проектных задач.
-- `minimal`: в основном финальные ответы. Хорошо, когда нужен тихий чат.
+- `verbose`: каждый tool/status event приходит отдельным тихим сообщением.
+- `live`: tool/status events собираются в один редактируемый progress message.
+- `minimal`: tool/status events полностью скрываются.
+
+Human-readable промежуточные обновления остаются отдельными сообщениями во всех
+режимах. Нормализованный финальный ответ всегда приходит как один отдельный
+логический ответ. `live` — лучший default для большинства проектных задач.
 
 ## TUI Mode
 
@@ -357,18 +399,26 @@ Slash commands устроены отдельно: в tmux topics non-bot command
   переключении с `tmux` на `subprocess` активная tmux session останавливается.
 - `/engine`: только forum topics; выбрать Claude Code или Codex. Смена engine
   сбрасывает активную session.
+- `/codex_update`: обновить Codex CLI вручную. Команда обходит automatic
+  cooldown, но блокируется другим bot-managed обновлением в этом процессе или
+  bot-managed активными Codex sessions. `/codex_update status` показывает
+  последний redacted result.
 - `/stream`: только forum topics; выбрать `verbose`, `live` или `minimal`.
 - `/resume`: только forum topics; возобновить сохраненную tmux session для cwd
   текущего topic.
 - `/tui`: показать и управлять живой tmux TUI.
 - `/tail`: legacy alias для `/tui`.
 - `/kill`: остановить активную tmux session и освободить ресурсы.
+- `/recycle`: перезапустить активный tmux runtime и подчистить MCP processes
+  текущего topic без намеренного сброса resumable context.
+- `/mcpstatus`: показать redacted diagnostics MCP-процессов текущего topic.
 
 Рекомендации:
 
 - Настоящая разработка: `/mode` -> `tmux`, `/stream` -> `live`.
 - Короткие разовые задачи: `/mode` -> `subprocess`, `/stream` -> `minimal` или
   `live`.
+- Runtime выглядит зависшим, но session надо сохранить: `/recycle`.
 - Старая session больше не нужна: `/kill`.
 
 ## MCP Bot Server
@@ -381,7 +431,16 @@ MCP config.
 
 - `send_message`
 - `send_image`
+- `send_image_gallery`
 - `send_document`
+
+Tools для сообщений, картинок, галерей и документов принимают опциональный
+Telegram `parse_mode`: `HTML` или `MarkdownV2`. Если Telegram отвергает
+formatting, server повторяет отправку без `parse_mode` там, где это безопасно.
+
+Публичные prompt modes также разрешают Context7 documentation tools, чтобы
+агенты могли получать актуальную документацию библиотек/API из настроенных MCP
+profiles.
 
 Не коммитьте реальные `.mcp.json`: там могут быть токены или локальные пути.
 
@@ -462,6 +521,12 @@ edits и shell/tool actions, разрешенные этим CLI.
 low-privilege Linux user. Если bot token утек, перевыпустите его в
 `@BotFather`.
 
+Значения из `.env` читаются как непрозрачные строки, поэтому фрагменты вроде
+`${NAME}` внутри токена не разворачиваются. Agent subprocesses запускаются с
+ограниченным окружением и не наследуют bot tokens и посторонние credentials.
+По умолчанию бот также использует отдельный workspace-local tmux server и при
+обновлении переносит со старого сервера только собственные сохранённые сессии.
+
 ## Development
 
 ```bash
@@ -480,7 +545,8 @@ Issues, bug reports и идеи welcome. Откройте GitHub issue, если
 
 Бота сделал Паша Молянов. Я пишу про бизнес, AI-ассистентов, разработку и
 запуск полезных сервисов в Telegram-канале:
-[@molyanov_blog](https://t.me/+zJ5qmSsoYediYzdi).
+[@molyanov_blog](https://t.me/+zJ5qmSsoYediYzdi). Мой сайт:
+[molyanov.ru](https://molyanov.ru).
 
 ## License
 

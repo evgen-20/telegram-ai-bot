@@ -12,16 +12,12 @@ restart.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
 
 _MODE_PROMPT_FALLBACKS: dict[str, tuple[str, ...]] = {
     "task": ("task.md", "task-manager.md", "default.md"),
-    "knowledge": ("knowledge.md", "default.md"),
     "free": ("free.md", "default.md"),
-    "project": ("project.md", "default.md"),
-    "blog": ("blog.md", "default.md"),
 }
 
 
@@ -39,12 +35,9 @@ def _read_prompt_with_fallback(mode: str) -> str:
 # Preload prompts once at import so the first `_get_mode_prompt` call is
 # cheap. Public builds may ship only default.md and task-manager.md.
 TASK_MODE_PROMPT = _read_prompt_with_fallback("task")
-KNOWLEDGE_MODE_PROMPT = _read_prompt_with_fallback("knowledge")
 FREE_MODE_PROMPT = _read_prompt_with_fallback("free")
-PROJECT_MODE_PROMPT = _read_prompt_with_fallback("project")
-BLOG_MODE_PROMPT = _read_prompt_with_fallback("blog")
 
-Mode = Literal["task", "knowledge", "free", "project", "blog"]
+Mode = str
 
 # Default mode used when no per-topic mode is configured (auto-registered topics).
 DEFAULT_MODE: Mode = "free"
@@ -54,20 +47,25 @@ DEFAULT_MODE: Mode = "free"
 # Core keeps only generic tools. Assistant-specific MCP tools are attached
 # by the private entry point via SessionManager.extend_mode_tools.
 
-_BOT_MCP_TOOLS = "mcp__bot__send_message,mcp__bot__send_image,mcp__bot__send_document"
+_BOT_MCP_TOOLS = (
+    "mcp__bot__send_message,"
+    "mcp__bot__send_image,"
+    "mcp__bot__send_image_gallery,"
+    "mcp__bot__send_document"
+)
 
-TASK_MODE_TOOLS = f"Skill,{_BOT_MCP_TOOLS},Read,Grep,Glob,Bash,Agent"
-KNOWLEDGE_MODE_TOOLS = f"Skill,{_BOT_MCP_TOOLS},Read,Write,Edit,Grep,Glob,Bash,Agent"
-FREE_MODE_TOOLS = f"Skill,{_BOT_MCP_TOOLS},Read,Write,Edit,Grep,Glob,Bash,Agent"
-PROJECT_MODE_TOOLS = f"{_BOT_MCP_TOOLS},Read,Write,Edit,Grep,Glob,Bash,Agent,Skill"
-BLOG_MODE_TOOLS = f"Skill,{_BOT_MCP_TOOLS},Read,Write,Edit,Grep,Glob,Bash,Agent"
+_CONTEXT7_MCP_TOOLS = (
+    "mcp__context7__resolve-library-id,mcp__context7__query-docs,mcp__context7__get-library-docs"
+)
+
+TASK_MODE_TOOLS = f"Skill,{_BOT_MCP_TOOLS},{_CONTEXT7_MCP_TOOLS},Read,Grep,Glob,Bash,Agent"
+FREE_MODE_TOOLS = (
+    f"Skill,{_BOT_MCP_TOOLS},{_CONTEXT7_MCP_TOOLS},Read,Write,Edit,Grep,Glob,Bash,Agent"
+)
 
 _MODE_TOOLS: dict[str, str] = {
     "task": TASK_MODE_TOOLS,
-    "knowledge": KNOWLEDGE_MODE_TOOLS,
     "free": FREE_MODE_TOOLS,
-    "project": PROJECT_MODE_TOOLS,
-    "blog": BLOG_MODE_TOOLS,
 }
 
 # prompts/ content is looked up per call with an mtime-cached scan, so a new

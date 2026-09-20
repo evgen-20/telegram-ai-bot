@@ -40,8 +40,11 @@ PUBLIC_BOT_COMMANDS: tuple[LocalizedBotCommand, ...] = (
     LocalizedBotCommand("mode", "Выбрать режим выполнения", "Choose execution mode"),
     LocalizedBotCommand("stream", "Выбрать режим ответов", "Choose response mode"),
     LocalizedBotCommand("engine", "Выбрать Claude Code или Codex", "Choose Claude Code or Codex"),
+    LocalizedBotCommand("codex_update", "Обновить Codex CLI", "Update Codex CLI"),
     LocalizedBotCommand("resume", "Возобновить сохраненную сессию", "Resume a saved session"),
     LocalizedBotCommand("kill", "Остановить tmux-сессию", "Stop the tmux session"),
+    LocalizedBotCommand("recycle", "Перезапустить runtime топика", "Restart topic runtime"),
+    LocalizedBotCommand("mcpstatus", "Показать MCP-процессы", "Show MCP processes"),
     LocalizedBotCommand("tui", "Открыть панель TUI", "Open the TUI panel"),
     LocalizedBotCommand(
         "tail",

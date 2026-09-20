@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -35,6 +36,7 @@ class QueueItem:
     source_messages: list[Message]
     target_session_id: str | None = None
     attachments: list[Path] = field(default_factory=list)
+    start_new_session: bool = False
 
 
 @dataclass
@@ -44,13 +46,17 @@ class ChatQueue:
     items: collections.deque[QueueItem] = field(default_factory=collections.deque)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     error_count: int = 0
+    # Interrupts the error-backoff sleep in _process_next. The sleep happens
+    # under `lock`, so without this clear()/cancel() would wait out the full
+    # backoff (up to 30s) before they can acquire the lock.
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 # Type alias for the process callback
-ProcessCallback = Callable[
-    [ChannelKey, str, list[Message], str | None, list[Path]],
-    Awaitable[None],
-]
+# (channel_key, prompt, source_messages, target_session_id, attachments) plus
+# an optional `start_new_session` keyword. Loosely typed on purpose: embedders
+# may accept the keyword, the public callback does not.
+ProcessCallback = Callable[..., Awaitable[None]]
 
 
 def _combine_prompts(entries: list[tuple[int, str]]) -> str:
@@ -110,6 +116,7 @@ class MessageQueue:
         message_id: int,
         source_message: Message,
         target_session_id: str | None = None,
+        start_new_session: bool = False,
         suppress_notification: bool = False,
         attachments: list[Path] | None = None,
     ) -> None:
@@ -134,26 +141,31 @@ class MessageQueue:
                 source_messages=[source_message],
                 target_session_id=target_session_id,
                 attachments=attachments,
+                start_new_session=start_new_session,
             )
             queue.items.append(item)
             logger.info(
                 "MSG_TRACE queue_enqueue channel=%s msg=%d action=immediate_start "
-                "prompt_len=%d target_sid=%s",
+                "prompt_len=%d target_sid=%s start_new_session=%s",
                 channel_key,
                 message_id,
                 len(prompt),
                 target_session_id,
+                start_new_session,
             )
             self._start_processing(channel_key)
             return
 
         # Processing is active — try to batch or create new item
-        target_key = target_session_id
         batched = False
 
         # Find last item in deque with matching target
         for item in reversed(queue.items):
-            if item.target_session_id == target_key:
+            if (
+                not start_new_session
+                and not item.start_new_session
+                and item.target_session_id == target_session_id
+            ):
                 item.entries.append((message_id, prompt))
                 item.source_messages.append(source_message)
                 item.attachments.extend(attachments)
@@ -175,6 +187,7 @@ class MessageQueue:
                 source_messages=[source_message],
                 target_session_id=target_session_id,
                 attachments=attachments,
+                start_new_session=start_new_session,
             )
             queue.items.append(item)
             position = len(queue.items)
@@ -185,13 +198,14 @@ class MessageQueue:
             )
         logger.info(
             "MSG_TRACE queue_enqueue channel=%s msg=%d action=%s position=%d "
-            "prompt_len=%d target_sid=%s",
+            "prompt_len=%d target_sid=%s start_new_session=%s",
             channel_key,
             message_id,
             "appended_to_existing" if batched else "new_item",
             position,
             len(prompt),
             target_session_id,
+            start_new_session,
         )
 
         if suppress_notification:
@@ -257,22 +271,33 @@ class MessageQueue:
                 combined_prompt = _combine_prompts(item.entries)
                 logger.info(
                     "MSG_TRACE queue_dequeue channel=%s msg_ids=%s prompt_len=%d "
-                    "target_sid=%s remaining=%d",
+                    "target_sid=%s start_new_session=%s remaining=%d",
                     channel_key,
                     [mid for mid, _ in item.entries],
                     len(combined_prompt),
                     item.target_session_id,
+                    item.start_new_session,
                     len(queue.items),
                 )
 
                 try:
-                    await self._process_callback(
-                        channel_key,
-                        combined_prompt,
-                        item.source_messages,
-                        item.target_session_id,
-                        item.attachments,
-                    )
+                    if item.start_new_session:
+                        await self._process_callback(
+                            channel_key,
+                            combined_prompt,
+                            item.source_messages,
+                            item.target_session_id,
+                            item.attachments,
+                            start_new_session=True,
+                        )
+                    else:
+                        await self._process_callback(
+                            channel_key,
+                            combined_prompt,
+                            item.source_messages,
+                            item.target_session_id,
+                            item.attachments,
+                        )
                     queue.error_count = 0
                 except Exception:
                     # Drop semantics: the item was already popped above and is
@@ -289,7 +314,16 @@ class MessageQueue:
                         backoff_sec,
                         exc_info=True,
                     )
-                    await asyncio.sleep(backoff_sec)
+                    # clear() before the notification await: a wake.set() fired
+                    # during _send_notification must not be erased, or clear()/
+                    # cancel() would wait out the full backoff.
+                    queue.wake.clear()
+                    # Silent loss is worse than noise: tell the user their
+                    # message died so they can resend instead of waiting on
+                    # a "Thinking…" that will never resolve.
+                    await self._send_notification(channel_key, t("ui.queue_item_dropped"))
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(queue.wake.wait(), timeout=backoff_sec)
 
     async def clear(self, channel_key: ChannelKey) -> None:
         """Clear the queue for a channel: wait for active processing, then discard pending items."""
@@ -307,6 +341,7 @@ class MessageQueue:
         await self._session_manager.cancel(channel_key)
 
         # Wait for processing to finish, then clear under lock
+        queue.wake.set()  # interrupt a possible error-backoff sleep
         async with queue.lock:
             queue.items.clear()
 
@@ -318,17 +353,34 @@ class MessageQueue:
         queue = self._get_queue(channel_key)
         dropped = len(queue.items)
         queue.items.clear()
+        queue.wake.set()  # interrupt a possible error-backoff sleep
 
         stopped = await self._session_manager.cancel(channel_key)
         return stopped or dropped > 0
 
     async def shutdown(self) -> None:
-        """Cancel background tasks, clear all queues."""
+        """Cancel background tasks, notify owners of dropped items, clear all queues."""
         # Cancel notification tasks
         for task in self._background_tasks:
             task.cancel()
         await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._background_tasks.clear()
+
+        # Pending items die with the restart — tell each affected channel so
+        # the user resends instead of waiting on a reply that never comes.
+        affected = [key for key, queue in self._queues.items() if queue.items]
+        if affected:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *[
+                            self._send_notification(key, t("ui.queue_dropped_shutdown"))
+                            for key in affected
+                        ],
+                        return_exceptions=True,
+                    ),
+                    timeout=5.0,
+                )
 
         # Clear all channel queues (items only — lock releases naturally)
         for _channel_key, queue in self._queues.items():

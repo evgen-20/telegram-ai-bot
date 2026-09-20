@@ -15,8 +15,13 @@ from typing import TYPE_CHECKING, Any, cast
 
 from telegram_bot.core.services.bot_mcp_runtime import ensure_bot_runtime_mcp_config
 from telegram_bot.core.services.claude import StreamEvent
-from telegram_bot.core.services.tmux_spawn import file_size, spawn_tmux_sync
-from telegram_bot.core.services.tmux_state import TmuxSessionState, _normalize_state_dict
+from telegram_bot.core.services.tmux_spawn import (
+    file_size,
+    sanitized_tmux_environment,
+    spawn_tmux_sync,
+    tmux_pane_inherits_disallowed_environment,
+)
+from telegram_bot.core.services.tmux_state import TmuxSessionState, parse_state_entry
 from telegram_bot.core.types import ChannelKey
 
 
@@ -45,23 +50,75 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _topic_base_mcp_config(
+    channel_key: ChannelKey,
+    *owners: object | None,
+) -> tuple[bool, str | None]:
+    """Return the currently configured topic MCP profile, if one exists.
+
+    Persisted ``state.base_mcp_config`` is only a cache of what was true when
+    the tmux session was created. On bot restart, topic_config.json is the
+    source of truth: otherwise old long-lived sessions keep resurrecting with
+    stale MCP profiles after a config deploy.
+    """
+    thread_id = channel_key[1]
+    if thread_id is None:
+        return False, None
+
+    for owner in owners:
+        if owner is None:
+            continue
+        topic_config = getattr(owner, "_topic_config", None)
+        if topic_config is None:
+            getter = getattr(owner, "get_topic_config", None)
+            topic_config = getter() if callable(getter) else None
+        get_topic = getattr(topic_config, "get_topic", None)
+        if not callable(get_topic):
+            continue
+        try:
+            topic = get_topic(thread_id)
+        except Exception:
+            logger.warning("Failed to read topic MCP config for %s", channel_key, exc_info=True)
+            continue
+        mcp_config = getattr(topic, "mcp_config", None)
+        if isinstance(mcp_config, str) and mcp_config:
+            return True, mcp_config
+        return True, None
+    return False, None
+
+
 def _ensure_runtime_mcp_config(
     *,
     state: TmuxSessionState,
     channel_key: ChannelKey,
     session_manager: object | None,
+    manager: object | None = None,
 ) -> None:
     if session_manager is None:
         return
     settings = getattr(session_manager, "_settings", None)
-    project_root = getattr(settings, "project_root", None)
+    application_root = getattr(settings, "app_root_path", None)
+    if not isinstance(application_root, str | Path):
+        application_root = getattr(settings, "app_root", None) or getattr(
+            settings, "project_root", None
+        )
     default_getter = getattr(session_manager, "default_mcp_config_path", None)
     default_mcp = str(default_getter()) if callable(default_getter) else ""
+    has_topic_config, current_topic_mcp = _topic_base_mcp_config(
+        channel_key, session_manager, manager
+    )
+    base_mcp_config = (
+        current_topic_mcp or default_mcp
+        if has_topic_config
+        else state.base_mcp_config or state.mcp_config or default_mcp
+    )
+    if has_topic_config:
+        state.base_mcp_config = base_mcp_config or None
     state.mcp_config = ensure_bot_runtime_mcp_config(
-        base_mcp_config=state.base_mcp_config or state.mcp_config or default_mcp or None,
+        base_mcp_config=base_mcp_config or None,
         channel_key=channel_key,
         runtime_path=Path(state.session_dir) / "mcp.runtime.json",
-        project_root=project_root,
+        project_root=application_root,
     )
 
 
@@ -83,6 +140,7 @@ def build_resume_startup_cmd(
             mode=mode,
             mcp_config=mcp_config or "",
             resume_session_id=session_id,
+            model=model,
         ),
     )
 
@@ -107,9 +165,19 @@ def restore_all(
     if not manager._state_store.exists():
         return {}
 
-    raw: dict[str, Any] = manager._state_store.load_raw()
+    load_result = manager._state_store.load()
+    if not load_result.ok:
+        logger.warning("restore_all: durable tmux state is poisoned; skipping restore")
+        return {}
+    raw: dict[str, Any] = load_result.raw
     if not raw:
         return {}
+
+    # tmux outlives the bot service and keeps a global environment. Remove
+    # variables outside the agent allowlist before reattaching live panes.
+    from telegram_bot.core.services import tmux_manager as _tm
+
+    sanitized_tmux_environment(run=_tm.subprocess.run)  # type: ignore[attr-defined]
 
     restored: dict[ChannelKey, TmuxSessionState] = {}
     for key_str, data in raw.items():
@@ -119,10 +187,15 @@ def restore_all(
                 int(chat_id_str),
                 int(thread_str) if thread_str != "None" else None,
             )
-            # Must normalize BEFORE constructing — otherwise the dataclass
-            # default "tui-v1" would silently overwrite the legacy marker
-            # for old state.json entries missing runner_version.
-            state = TmuxSessionState(**_normalize_state_dict(data))
+            parsed = parse_state_entry(data)
+            if parsed.state is None:
+                logger.warning(
+                    "restore_all: malformed state entry for key %s preserved: %s",
+                    key_str,
+                    parsed.error,
+                )
+                continue
+            state = parsed.state
             # Codex sessions are owned by CodexSessionManager since Phase 7;
             # legacy state.json entries from before the split are ignored
             # here and pruned on the next `manager._save_state()` below.
@@ -139,11 +212,34 @@ def restore_all(
             is_claude_tui = rv in {"tui-v1", "claude-tui-v1"} and state.provider == "claude"
             is_supported_tui = is_claude_tui
 
+            if (
+                alive
+                and is_supported_tui
+                and tmux_pane_inherits_disallowed_environment(
+                    state.session_name,
+                    run=_tm.subprocess.run,  # type: ignore[attr-defined]
+                )
+            ):
+                logger.warning(
+                    "Restarting legacy tmux session %s with a sanitized environment",
+                    state.session_name,
+                )
+                _tm.subprocess.run(  # type: ignore[attr-defined]
+                    ["tmux", "kill-session", "-t", f"={state.session_name}"],
+                    capture_output=True,
+                    check=False,
+                    env=sanitized_tmux_environment(
+                        run=_tm.subprocess.run  # type: ignore[attr-defined]
+                    ),
+                )
+                alive = False
+
             if alive and is_supported_tui:
                 _ensure_runtime_mcp_config(
                     state=state,
                     channel_key=channel_key,
                     session_manager=session_manager,
+                    manager=manager,
                 )
                 manager._sessions[channel_key] = state
                 restored[channel_key] = state
@@ -171,6 +267,7 @@ def restore_all(
                     state=state,
                     channel_key=channel_key,
                     session_manager=session_manager,
+                    manager=manager,
                 )
                 # Resurrecting a dead session: transcript exists, so CC
                 # must be told to --resume (not --session-id, which would
@@ -240,7 +337,10 @@ def restore_all(
 
 async def resume_tails(
     manager: TmuxManager,
-    on_event_factory: Callable[[ChannelKey], Callable[[StreamEvent], Awaitable[None] | None]],
+    on_event_factory: Callable[
+        [ChannelKey],
+        Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
+    ],
 ) -> None:
     """Start recovery tails for all alive sessions on bot startup.
 
@@ -277,7 +377,7 @@ async def run_recovery_tail(
     channel_key: ChannelKey,
     state: TmuxSessionState,
     output_path: Path,
-    on_event: Callable[[StreamEvent], Awaitable[None] | None],
+    on_event: Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
     cancel_event: asyncio.Event,
 ) -> None:
     """Drain pending output and continue tailing until CC finishes.
@@ -286,12 +386,26 @@ async def run_recovery_tail(
     user message cancels it via cancel_event, or the tmux session dies.
     This handles the case where CC is mid-Bash-command at restart and
     hasn't written to the transcript yet when resume_tails runs.
+
+    Wraps on_event so normalized turn_start/turn_end events own the processing
+    flag. Intermediate text and final delivery do not clear another turn.
     """
+
+    async def _on_event_clearing(event: StreamEvent) -> bool | None:
+        if event.type == "result":
+            manager.clear_processing(channel_key)
+            return None
+        ret = on_event(event)
+        if asyncio.iscoroutine(ret):
+            ret = await ret
+        manager.handle_turn_event(channel_key, event)
+        return cast(bool | None, ret)
+
     try:
         _result_text, _new_session_id = await manager._tail_until_done(
             output_path,
             state,
-            on_event,
+            _on_event_clearing,
             cancel_event,
             idle_exit_sec=None,
         )
@@ -312,4 +426,13 @@ async def run_recovery_tail(
         )
         if manager._cancel_events.get(channel_key) is cancel_event:
             manager._cancel_events.pop(channel_key, None)
-        await manager.close_buffer(channel_key)
+        if not cancel_event.is_set():
+            # Tail died on its own (tmux death, timeout) — nothing left to
+            # clear the processing flag, so drop it here. On cancel the
+            # canceller (send_stream / cancel / clear_context) owns the flag:
+            # send_stream sets it True for the next prompt right before
+            # cancelling this tail, and popping it here would erase that.
+            manager.clear_processing(channel_key)
+        # A new normal tail may already have queued its own placeholder before
+        # cancelling this recovery tail. Preserve that candidate.
+        await manager.close_active_buffer(channel_key)

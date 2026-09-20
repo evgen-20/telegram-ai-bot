@@ -50,13 +50,13 @@ class SessionBackend(Protocol):
         resume_session_id: str | None = None,
         provider: str = "claude",
         model: str | None = None,
-    ) -> None: ...
+    ) -> bool: ...
 
     async def send_stream(
         self,
         channel_key: ChannelKey,
         prompt: str,
-        on_event: Callable[[StreamEvent], Awaitable[None] | None],
+        on_event: Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
         *,
         attachments: list[Path] | None = None,
     ) -> str: ...

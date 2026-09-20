@@ -217,8 +217,10 @@ class CodexSessionManager:
         resume_session_id: str | None = None,
         provider: str = "claude",
         model: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Spawn a Codex proxy client and open (or resume) a thread.
+
+        Returns True once the thread is live; failures raise instead.
 
         ``mode``, ``mcp_config``, ``chat_id``, ``session_manager`` and
         ``provider`` are accepted to satisfy the Protocol but are not used
@@ -251,12 +253,13 @@ class CodexSessionManager:
             )
             self._sessions[channel_key] = state
             self._persist()
+            return True
 
     async def send_stream(
         self,
         channel_key: ChannelKey,
         prompt: str,
-        on_event: Callable[[StreamEvent], Awaitable[None] | None],
+        on_event: Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
         *,
         attachments: list[Path] | None = None,
     ) -> str:

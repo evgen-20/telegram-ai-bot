@@ -17,7 +17,10 @@ lru_cache around _get_lang() keeps a single value for the process lifetime.
 from __future__ import annotations
 
 import functools
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_LANG = "en"
 
@@ -47,6 +50,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.tmux_failed": "❌ Failed to start tmux: {exc}",
         "ui.tmux_killed": "🗑 Tmux session killed",
         "ui.tmux_not_active": "No active tmux session in this topic",
+        "ui.recycle_done": "♻️ Runtime restarted",
+        "ui.recycle_failed": "❌ Couldn't restart the runtime. Try again in a moment.",
         "ui.engine_starting": (
             "🔄 {engine} is starting up — please wait a few seconds before sending."
         ),
@@ -56,6 +61,19 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⚠️ {engine} started but input is blocked — most likely a modal dialog."
             " Use /tui to see the pane and dismiss it."
         ),
+        "ui.codex_update_status": (
+            "Codex update status: <b>{status}</b>\n"
+            "Last success: <code>{last_success}</code>\n"
+            "{output}"
+        ),
+        "ui.codex_update_running": "🔄 Updating Codex...",
+        "ui.codex_update_success": "✅ Codex update finished.\n<pre>{output}</pre>",
+        "ui.codex_update_failed": "❌ Codex update failed ({status}).\n<pre>{output}</pre>",
+        "ui.codex_update_already_running": "Codex update is already running.",
+        "ui.codex_update_active_sessions": (
+            "⚠️ Codex update skipped: stop active Codex sessions first with /kill."
+        ),
+        "ui.codex_update_cooldown": "Codex auto-update skipped: cooldown is active.",
         # --- UI: tail / tui feature strings (Wave 3 tmux-tui-mode) ----
         "ui.tail_unavailable": (
             "⚠️ No active tmux session — /tui is unavailable."
@@ -67,6 +85,12 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⚠️ Message NOT sent — CC is waiting on a modal dialog.\n"
             "Your message: <code>{prompt}</code>\n"
             "Dismiss the modal (Esc / pick an option), then resend."
+        ),
+        "ui.delivery_unconfirmed_header": (
+            "⚠️ Delivery could not be confirmed — the message may already be "
+            "waiting in Codex input.\n"
+            "Your message: <code>{prompt}</code>\n"
+            "Open /tui and check the input. Do not resend yet."
         ),
         "ui.modal_idle_detected": (
             "⚠️ CC is waiting on a modal dialog.\n"
@@ -126,6 +150,18 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.stream_mode_invalid": "Unknown mode",
         "ui.stream_mode_not_in_forum": "⚠️ /stream works only in forum topics.",
         "ui.stream_mode_write_failed": "Failed to save config",
+        "ui.claude_no_text": "Claude finished the turn without a text response.",
+        "ui.claude_stop_sequence_no_text": (
+            "Claude finished on a stop sequence without a text response."
+        ),
+        "ui.claude_limit_no_text": "Claude reached the output limit without a text response.",
+        "ui.claude_context_no_text": ("Claude reached the context limit without a text response."),
+        "ui.claude_refused_no_text": "Claude refused to answer.",
+        "ui.claude_unknown_completion": (
+            "Claude ended the previous turn with an unknown completion format."
+        ),
+        "ui.claude_limit_note": "\n\n⚠️ The answer was cut off by the output limit.",
+        "ui.claude_context_note": "\n\n⚠️ The answer was cut off by the context limit.",
         "ui.session_switched": "🔄 session: {sid}",
         "ui.session_switched_engine": "🔄 {engine} session: {sid}",
         "ui.resume_picker_caption_hdr": "Sessions for <code>{cwd}</code>, page {page}/{total}",
@@ -227,6 +263,13 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.queue_added_batch": "Added to batch, #{position} in queue",
         "ui.queue_added": "Added to queue (#{position})",
         "ui.queue_session_suffix": ", session: {sid}",
+        "ui.queue_item_dropped": (
+            "⚠️ Message processing failed — it was not delivered to the agent. Please resend."
+        ),
+        "ui.queue_dropped_shutdown": (
+            "⚠️ Bot is restarting — your queued message was not processed. "
+            "Please resend it after the restart."
+        ),
         # --- Tool status (shown while CC runs a tool) -----------------
         "tool.read": "📖 Reading file",
         "tool.grep": "🔍 Searching",
@@ -241,6 +284,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "tool.agent_done_with_desc": "✅ Subagent finished: {desc}",
         "tool.send_message": "💬 Sending message...",
         "tool.send_image": "🖼 Sending image...",
+        "tool.send_image_gallery": "🖼 Sending gallery...",
         "tool.send_document": "📎 Sending document...",
         "tool.fetch_url": "🌐 Fetching URL",
         "tool.run_tests": "🧪 Running tests",
@@ -276,6 +320,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.tmux_failed": "❌ Не удалось запустить tmux: {exc}",
         "ui.tmux_killed": "🗑 Tmux-сессия убита",
         "ui.tmux_not_active": "В этом топике нет активной tmux-сессии",
+        "ui.recycle_done": "♻️ Runtime перезапущен",
+        "ui.recycle_failed": (
+            "❌ Не удалось перезапустить runtime. Попробуй ещё раз через пару секунд."
+        ),
         "ui.engine_starting": (
             "🔄 {engine} запускается — подожди несколько секунд перед отправкой."
         ),
@@ -285,6 +333,19 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⚠️ {engine} запустился, но ввод заблокирован — скорее всего модальное окно."
             " Открой /tui, чтобы увидеть экран сессии и закрыть его."
         ),
+        "ui.codex_update_status": (
+            "Статус обновления Codex: <b>{status}</b>\n"
+            "Последний успех: <code>{last_success}</code>\n"
+            "{output}"
+        ),
+        "ui.codex_update_running": "🔄 Обновляю Codex...",
+        "ui.codex_update_success": "✅ Codex обновлён.\n<pre>{output}</pre>",
+        "ui.codex_update_failed": "❌ Обновление Codex упало ({status}).\n<pre>{output}</pre>",
+        "ui.codex_update_already_running": "Обновление Codex уже идёт.",
+        "ui.codex_update_active_sessions": (
+            "⚠️ Обновление Codex пропущено: сначала останови активные Codex-сессии через /kill."
+        ),
+        "ui.codex_update_cooldown": "Автообновление Codex пропущено: cooldown ещё активен.",
         # --- UI: tail / tui feature strings (Wave 3 tmux-tui-mode) ----
         "ui.tail_unavailable": (
             "⚠️ Нет активной tmux-сессии — /tui недоступен."
@@ -298,6 +359,12 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⚠️ Сообщение НЕ отправлено — CC ждёт действие в модальном диалоге.\n"
             "Твоё сообщение: <code>{prompt}</code>\n"
             "Закрой диалог (Esc / выбери пункт) и отправь заново."
+        ),
+        "ui.delivery_unconfirmed_header": (
+            "⚠️ Не удалось подтвердить отправку — сообщение уже может находиться "
+            "в поле ввода Codex.\n"
+            "Твоё сообщение: <code>{prompt}</code>\n"
+            "Открой /tui и проверь поле ввода. Пока не отправляй сообщение повторно."
         ),
         "ui.modal_idle_detected": (
             "⚠️ CC ждёт действие в модальном диалоге.\n"
@@ -355,6 +422,16 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.stream_mode_invalid": "Неизвестный режим",
         "ui.stream_mode_not_in_forum": "⚠️ /stream работает только внутри форум-топиков.",
         "ui.stream_mode_write_failed": "Не удалось записать конфиг",
+        "ui.claude_no_text": "Claude завершил ход без текстового ответа.",
+        "ui.claude_stop_sequence_no_text": (
+            "Claude завершил ход по стоп-последовательности без текстового ответа."
+        ),
+        "ui.claude_limit_no_text": "Claude достиг лимита вывода без текстового ответа.",
+        "ui.claude_context_no_text": "Claude достиг лимита контекста без текстового ответа.",
+        "ui.claude_refused_no_text": "Claude отказался отвечать.",
+        "ui.claude_unknown_completion": ("Claude завершил предыдущий ход в неизвестном формате."),
+        "ui.claude_limit_note": "\n\n⚠️ Ответ оборван из-за лимита вывода.",
+        "ui.claude_context_note": "\n\n⚠️ Ответ оборван из-за лимита контекста.",
         "ui.session_switched": "🔄 сессия: {sid}",
         "ui.session_switched_engine": "🔄 сессия {engine}: {sid}",
         "ui.resume_picker_caption_hdr": "Сессии для <code>{cwd}</code>, страница {page}/{total}",
@@ -403,6 +480,13 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.queue_added_batch": "Добавлено в батч, он №{position} в очереди",
         "ui.queue_added": "Добавлено в очередь (№{position})",
         "ui.queue_session_suffix": ", сессия: {sid}",
+        "ui.queue_item_dropped": (
+            "⚠️ Не удалось обработать сообщение — оно не дошло до агента. Отправь ещё раз."
+        ),
+        "ui.queue_dropped_shutdown": (
+            "⚠️ Бот перезапускается — сообщение из очереди не обработано. "
+            "Отправь его ещё раз после рестарта."
+        ),
         # --- Tool status ----------------------------------------------
         "tool.read": "📖 Читаю файл",
         "tool.grep": "🔍 Ищу",
@@ -417,6 +501,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "tool.agent_done_with_desc": "✅ Субагент завершил работу: {desc}",
         "tool.send_message": "💬 Отправляю сообщение...",
         "tool.send_image": "🖼 Отправляю картинку...",
+        "tool.send_image_gallery": "🖼 Отправляю галерею...",
         "tool.send_document": "📎 Отправляю документ...",
         "tool.fetch_url": "🌐 Загружаю URL",
         "tool.run_tests": "🧪 Запускаю тесты",
@@ -458,7 +543,14 @@ def t(key: str, **kwargs: Any) -> str:
     if template is None:
         template = MESSAGES[_DEFAULT_LANG].get(key, key)
     if kwargs:
-        return template.format(**kwargs)
+        # t() is used on error paths — a template/kwargs mismatch (stray
+        # brace, renamed placeholder) must degrade to the raw template, not
+        # raise and mask the original error.
+        try:
+            return template.format(**kwargs)
+        except (KeyError, IndexError, ValueError):
+            logger.warning("t(%s): format failed with kwargs %s", key, sorted(kwargs))
+            return template
     return template
 
 

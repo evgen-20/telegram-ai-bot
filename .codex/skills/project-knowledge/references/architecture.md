@@ -5,10 +5,16 @@ The bot runtime is split into:
 
 - `src/telegram_bot/__main__.py` - public entry point, aiogram wiring, shutdown.
 - `src/telegram_bot/core/handlers/` - Telegram command, text, media, voice, forward, topic, and TUI handlers.
-- `src/telegram_bot/core/services/` - session management, provider adapters, topic config, streaming, tmux, resume, MCP runtime, and transcription.
+- `src/telegram_bot/core/services/` - session management, provider adapters, topic config, streaming, tmux, resume, MCP runtime, transcription, incoming rich content normalization, and rich final-answer rendering.
 - `src/telegram_bot/core/tui/` - tmux TUI capture, modal detection, keyboard controls, routing, and transcript helpers.
-- `mcp-servers/bot/` - MCP server that lets an agent send messages or files back to Telegram.
+- `mcp-servers/bot/` - MCP server that lets an agent send messages, images,
+  image galleries, and files back to Telegram.
 - `src/telegram_bot/prompts/` - generic public prompt modes.
+
+The reusable core registers only the public `free` and `task` prompt modes.
+An application that embeds the core must register any additional prompt mode
+and its complete tool policy outside `src/telegram_bot/core/`; adding a prompt
+file alone does not make a mode runnable.
 
 Two independent runtime axes are important:
 
@@ -21,9 +27,50 @@ online with a user-facing install message when neither CLI is available.
 
 `stream_mode` controls Telegram progress delivery:
 
-- `verbose`: separate progress messages.
-- `live`: editable progress buffer plus final answer.
-- `minimal`: final-answer oriented delivery.
+- `verbose`: every tool/status event is a separate silent message.
+- `live`: tool/status events share an editable progress buffer.
+- `minimal`: tool/status events are suppressed.
+
+Human-readable intermediate text remains separate in every stream mode. Provider
+transcripts are normalized into turn start, ordered status/text events, one
+logical final answer, and turn end. A live progress buffer belongs to one turn,
+so late events cannot close a newer turn's progress surface.
+
+Tmux transcript delivery uses a FIFO callback queue and persists a transcript
+checkpoint only after all Telegram callbacks through that point complete.
+Recovery rebuilds parser state from the nearest provider turn boundary before
+resuming delivery. An uncertain or incomplete Telegram send may be replayed
+after restart, but its missing suffix is not silently skipped.
+
+Incoming Telegram rich messages are normalized into agent-readable text. Text
+blocks, tables, footnotes, and structural placeholders stay visible; rich photo
+blocks become image attachments when Telegram provides files. Outgoing rich
+message rendering is intentionally narrow: intermediate progress always stays
+plain, and only final answers with Markdown tables are eligible for Telegram
+RichText/RichMessage delivery. Unsupported rich payloads fall back to plain
+Telegram text. Telegram's schema starts at
+https://core.telegram.org/type/RichText.
 
 Forum topics are isolated by `(chat_id, thread_id)`. Session mappings and tmux
 state are runtime files and must not be committed.
+
+The public entrypoint uses a workspace-local, mode-0700 tmux server directory
+when `TMUX_TMPDIR` is not configured. On the first upgraded start it migrates
+only state-owned bot sessions from the legacy default server, leaving unrelated
+tmux sessions untouched.
+
+The standard installation uses one `PROJECT_ROOT`. Advanced installations may
+split immutable application code (`APP_ROOT`) from editable projects and
+runtime state (`AGENT_WORKSPACE_ROOT`). Relative topic config, session mapping,
+tmux, cache, generated runtime MCP configs, and default-cwd paths resolve under
+the workspace root. MCP launchers and optional base MCP profiles resolve under
+the application root.
+
+Long-lived tmux runtimes generate topic-scoped MCP runtime configs. These
+configs tag child processes with non-secret runtime metadata so `/kill`,
+`/recycle`, subprocess cleanup, and diagnostics can identify bot-owned MCP
+processes without relying on private paths.
+
+Operational commands include `/recycle` for restarting a stuck tmux runtime
+while preserving resumable context when possible, and `/mcpstatus` for redacted
+MCP process diagnostics in the current topic.

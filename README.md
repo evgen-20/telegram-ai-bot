@@ -21,14 +21,18 @@ tokens, or machine-specific deployment config.
 - Choose Claude Code or Codex per topic.
 - Use a persistent `tmux` session for real development work, or a short-lived
   subprocess for simple one-off tasks.
-- Send text, photos, documents, forwarded message batches, and optional voice
-  messages.
-- Use custom prompt modes for different workflows.
+- Send text, photos, documents, forwarded message batches, Telegram rich
+  messages, and optional voice messages.
+- Customize the bundled example prompt for a second workflow.
 - Open a live TUI snapshot with `/tui` and press buttons for Enter, Esc, arrows,
   digits, refresh, and close.
 - Resume saved sessions by replying to previous bot messages or with `/resume`.
-- Let the agent send messages, images, and documents back to Telegram through
-  the bundled bot MCP server.
+- Restart a stuck topic runtime with `/recycle` and inspect MCP runtime process
+  health with `/mcpstatus`.
+- Let the agent send messages, images, image galleries, and documents back to
+  Telegram through the bundled bot MCP server.
+- Render final answers that contain Markdown tables as Telegram rich messages,
+  with automatic fallback to plain Telegram text.
 
 ## How It Works
 
@@ -40,6 +44,24 @@ only the control surface. When you send a message, the bot:
 3. resolves the current chat or forum topic settings;
 4. sends the prompt to Claude Code or Codex in the configured working directory;
 5. streams progress and the final answer back to Telegram.
+
+## Rich Final Answers
+
+The bot can read incoming Telegram rich messages, including forwarded rich
+posts. Text blocks are normalized into Markdown-like text for the agent, tables
+and footnotes stay visible in that text, and rich photo blocks are exposed as
+image attachments when Telegram provides files for them. Non-text rich media
+without accessible files is kept as explicit placeholders.
+
+Intermediate progress messages are always plain Telegram messages. When the
+agent's final answer contains a Markdown table, the bot converts that answer to
+Telegram rich message blocks and sends it with Telegram's RichText/RichMessage
+API. Final answers without tables stay plain. If Telegram rejects the rich
+payload or the installed Telegram library cannot send it, the bot falls back to
+the normal text response.
+
+Telegram's public schema for this feature starts at
+https://core.telegram.org/type/RichText.
 
 Forum topics are isolated by Telegram `chat_id` and `thread_id`. Each topic can
 have its own:
@@ -138,12 +160,17 @@ ALLOWED_USER_IDS=[123456789]
 BOT_LANG=en
 DEEPGRAM_API_KEY=
 PROJECT_ROOT=.
+APP_ROOT=
+AGENT_WORKSPACE_ROOT=
 DEFAULT_CWD=.
 FILE_CACHE_DIR=./data
 TOPIC_CONFIG_PATH=./topic_config.json
 TMUX_SESSIONS_DIR=./tmux_sessions
 CC_MAX_TURNS=100
 CC_INACTIVITY_KILL_SEC=1800
+CODEX_AUTO_UPDATE_ENABLED=true
+CODEX_UPDATE_TIMEOUT_SEC=180
+CODEX_UPDATE_COOLDOWN_SEC=86400
 ```
 
 Notes:
@@ -151,8 +178,15 @@ Notes:
 - `TELEGRAM_BOT_TOKEN`: create a bot in `@BotFather`.
 - `ALLOWED_USER_IDS`: JSON array of Telegram user IDs allowed to use the bot.
 - `BOT_LANG`: `en` or `ru`. Restart the bot after changing it.
+- `PROJECT_ROOT`: the standard single-checkout root. Leave `APP_ROOT` and
+  `AGENT_WORKSPACE_ROOT` empty for a normal installation.
+- `APP_ROOT` / `AGENT_WORKSPACE_ROOT`: optional advanced split layout. The
+  first contains installed code and MCP launchers; the second contains editable
+  projects, topic config, session mappings, tmux state, and downloaded files.
 - `DEFAULT_CWD`: default working directory for unconfigured topics.
 - `DEEPGRAM_API_KEY`: leave empty if you do not need voice messages.
+- `CODEX_AUTO_UPDATE_ENABLED`: enables automatic and manual Codex updates.
+  Timeout bounds every update; cooldown applies only to automatic updates.
 
 Run in the foreground:
 
@@ -217,8 +251,7 @@ Example:
       "mcp_config": null,
       "stream_mode": "live",
       "exec_mode": "tmux",
-      "engine": "codex",
-      "model": null
+      "engine": "codex"
     }
   }
 }
@@ -235,11 +268,17 @@ Fields:
 - `stream_mode`: `verbose`, `live`, or `minimal`.
 - `exec_mode`: `tmux` or `subprocess`.
 - `engine`: `claude` or `codex`.
-- `model`: optional model override, or `null`.
+- `model`: legacy single model override, or `null`.
+- `models`: optional per-engine overrides keyed by `claude` and/or `codex`.
+  Resolution is `models[active_engine]`, then `model`, then the provider
+  default; manual `/engine` changes preserve the map. During automatic
+  missing-CLI fallback, the first fallback request uses the provider default;
+  the saved per-engine override applies from the next request.
 
-Use absolute paths for `cwd` and `mcp_config`. Set `mcp_config` to `null`
-unless you already have a real MCP config file for that project. Do not commit
-your real `topic_config.json`.
+Use absolute paths for `cwd` and `mcp_config`. Keep `mcp_config` as `null` by
+default. Use a project MCP config only after checking it for secrets and private
+dependencies; extra servers have their own provider/tool-policy constraints.
+Do not commit your real `topic_config.json`.
 
 ## Prompt Modes
 
@@ -251,12 +290,11 @@ Public modes:
 - `task`: a small replaceable task-management example, backed by
   `task-manager.md`.
 
-For no-code customization, edit or replace `task-manager.md` and use
-`"mode": "task"` in selected topics. If you want a new mode name such as
-`blog`, add the prompt file and extend the runtime tool mapping for that mode in
-code; otherwise the agent may not have an allowed tool list. Keep private data,
-secrets, personal workflows, and real customer context out of the public
-repository.
+For no-code customization, edit or replace `task-manager.md` and keep
+`"mode": "task"` in selected topics. A new mode name requires code changes to
+the runtime resolver and an explicit tool policy, plus tests; a prompt file
+alone is not a complete mode. Keep private data, secrets, personal workflows,
+and real customer context out of the public repository.
 
 ## Execution Modes
 
@@ -277,8 +315,9 @@ Use this when:
 - the agent may ask permission questions or show interactive menus;
 - you want `/resume` and reply-to-session behavior.
 
-`tmux` consumes resources while the session is alive. Use `/kill` when you no
-longer need it.
+`tmux` consumes resources while the session is alive. Use `/recycle` if a topic
+runtime is stuck but you want to keep resumable context; use `/kill` when you no
+longer need the session.
 
 ### subprocess
 
@@ -296,10 +335,13 @@ topics, because they need a topic-specific config entry.
 
 `/stream` controls how much progress the bot sends back to Telegram.
 
-- `verbose`: sends detailed progress as separate messages. Useful for debugging.
-- `live`: keeps one editable progress message and then sends the final answer.
-  This is the best default for most project work.
-- `minimal`: focuses on final answers. Useful when you want a quieter chat.
+- `verbose`: sends every tool/status event as a separate silent message.
+- `live`: keeps tool/status events in one editable progress message.
+- `minimal`: suppresses tool/status events completely.
+
+Human-readable intermediate updates remain separate messages in every mode.
+The normalized final answer is always sent as one separate logical response.
+`live` is the best default for most project work.
 
 ## TUI Mode
 
@@ -353,18 +395,26 @@ still exists as a legacy alias, but `/clear` is the command shown in the menu.
   `tmux` to `subprocess` stops the active tmux session.
 - `/engine`: forum topics only; choose Claude Code or Codex. Changing engine
   resets the active session.
+- `/codex_update`: update Codex CLI manually. It bypasses the automatic
+  cooldown but is blocked by another bot-managed update in this process or
+  bot-managed active Codex sessions. `/codex_update status` shows the last
+  redacted result.
 - `/stream`: forum topics only; choose `verbose`, `live`, or `minimal`.
 - `/resume`: forum topics only; resume a saved tmux session for the current
   topic working directory.
 - `/tui`: show and control the live tmux TUI.
 - `/tail`: legacy alias for `/tui`.
 - `/kill`: stop the active tmux session and free resources.
+- `/recycle`: restart the active tmux runtime and clean topic-owned MCP
+  processes without intentionally clearing resumable context.
+- `/mcpstatus`: show redacted MCP process diagnostics for the current topic.
 
 Recommended defaults:
 
 - Real development: `/mode` -> `tmux`, `/stream` -> `live`.
 - Short one-off tasks: `/mode` -> `subprocess`, `/stream` -> `minimal` or
   `live`.
+- Runtime looks stuck but the session should be preserved: `/recycle`.
 - Old session no longer needed: `/kill`.
 
 ## MCP Bot Server
@@ -377,7 +427,15 @@ Public prompt modes allow these generic bot tools:
 
 - `send_message`
 - `send_image`
+- `send_image_gallery`
 - `send_document`
+
+The message, image, gallery, and document tools accept optional Telegram
+`parse_mode` values `HTML` or `MarkdownV2`. If Telegram rejects formatting, the
+server retries without `parse_mode` where that is safe.
+
+Public prompt modes also allow Context7 documentation tools so agents can fetch
+current library/API documentation from configured MCP profiles.
 
 Keep real `.mcp.json` files out of git. They may contain tokens or local paths.
 
@@ -458,6 +516,12 @@ directories you are not willing to let the agent read or edit. Prefer running
 the bot under a dedicated low-privilege Linux user. If the bot token leaks,
 rotate it in `@BotFather`.
 
+Values loaded from `.env` are treated as opaque strings, so token text such as
+`${NAME}` is not expanded. Agent subprocesses start with a constrained
+environment: bot tokens and unrelated service credentials are not inherited.
+The bot also uses a dedicated workspace-local tmux server by default and
+migrates only its own persisted sessions from older installations.
+
 ## Development
 
 ```bash
@@ -476,7 +540,8 @@ unclear, broken, or missing.
 
 Made by Pasha Molyanov. I write about business, AI assistants, development, and
 launching useful services in my Telegram channel:
-[@molyanov_blog](https://t.me/+zJ5qmSsoYediYzdi).
+[@molyanov_blog](https://t.me/+zJ5qmSsoYediYzdi). My website:
+[molyanov.ru](https://molyanov.ru).
 
 ## License
 

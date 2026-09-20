@@ -44,6 +44,7 @@ def _tool_status_map() -> dict[str, str]:
         "Agent": t("tool.agent"),
         "mcp__bot__send_message": t("tool.send_message"),
         "mcp__bot__send_image": t("tool.send_image"),
+        "mcp__bot__send_image_gallery": t("tool.send_image_gallery"),
         "mcp__bot__send_document": t("tool.send_document"),
     }
     mapping.update(_EXTRA_TOOL_STATUS)
@@ -240,9 +241,18 @@ class StreamEvent:
     as the caption when the type is `image_message`.
     """
 
-    type: Literal["status", "text", "result", "result_message", "image_message"]
+    type: Literal[
+        "status",
+        "text",
+        "result",
+        "result_message",
+        "image_message",
+        "turn_start",
+        "turn_end",
+    ]
     content: str
     session_id: str | None = None
+    turn_id: str | None = None
 
 
 def parse_cc_event(

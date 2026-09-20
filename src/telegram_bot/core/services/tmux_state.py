@@ -14,12 +14,16 @@ and one of the renames could fail or leave a partial file behind
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import logging
 import os
 import subprocess
 import threading
-from dataclasses import asdict, dataclass
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +34,6 @@ logger = logging.getLogger(__name__)
 
 # Top-level state.json keys that belong to a writer other than StateStore.
 # `StateStore.save()` must preserve them verbatim instead of dropping them.
-_FOREIGN_STATE_KEYS: tuple[str, ...] = ("codex_sessions",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +103,28 @@ class TmuxSessionState:
     base_mcp_config: str | None = None
 
 
+@dataclass(frozen=True)
+class StateLoadResult:
+    ok: bool
+    raw: dict[str, Any]
+    error: Exception | None = None
+
+
+@dataclass(frozen=True)
+class StateEntryParseResult:
+    state: TmuxSessionState | None
+    error: Exception | None = None
+
+
+_STATE_FIELD_NAMES = {field.name for field in fields(TmuxSessionState)}
+_SIGNIFICANT_BACKUP_FIELDS = {
+    "session_id",
+    "provider",
+    "cwd",
+    "runner_version",
+}
+
+
 def _normalize_state_dict(data: dict[str, Any]) -> dict[str, Any]:
     """Fill in runner_version for legacy state.json entries.
 
@@ -121,6 +146,18 @@ def _normalize_state_dict(data: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def parse_state_entry(raw: Any) -> StateEntryParseResult:
+    """Parse one durable state entry without rejecting unknown future fields."""
+    if not isinstance(raw, dict):
+        return StateEntryParseResult(None, TypeError("state entry is not an object"))
+    normalized = _normalize_state_dict(raw)
+    filtered = {key: value for key, value in normalized.items() if key in _STATE_FIELD_NAMES}
+    try:
+        return StateEntryParseResult(TmuxSessionState(**filtered))
+    except Exception as exc:
+        return StateEntryParseResult(None, exc)
+
+
 class StateStore:
     """JSON-backed store for the sessions map. Thread-safe around writes.
 
@@ -134,6 +171,7 @@ class StateStore:
     def __init__(self, state_path: Path) -> None:
         self._state_path = state_path
         self._write_lock = threading.Lock()
+        self._poisoned = False
 
     @property
     def path(self) -> Path:
@@ -142,18 +180,32 @@ class StateStore:
     def exists(self) -> bool:
         return self._state_path.exists()
 
-    def load_raw(self) -> dict[str, Any]:
-        """Return parsed state.json as dict, or {} on any read/parse error."""
+    @property
+    def poisoned(self) -> bool:
+        return self._poisoned
+
+    def load(self) -> StateLoadResult:
+        """Load durable state, marking invalid/non-object JSON as poisoned."""
         if not self._state_path.exists():
-            return {}
+            self._poisoned = False
+            return StateLoadResult(ok=True, raw={})
         try:
             raw = json.loads(self._state_path.read_text())
-        except Exception:
+            if not isinstance(raw, dict):
+                raise ValueError("tmux state top-level JSON is not an object")
+        except Exception as exc:
             logger.warning("Failed to load tmux state", exc_info=True)
-            return {}
-        return raw if isinstance(raw, dict) else {}
+            self._poisoned = True
+            self._backup_unreadable_state()
+            return StateLoadResult(ok=False, raw={}, error=exc)
+        self._poisoned = False
+        return StateLoadResult(ok=True, raw=raw)
 
-    def save(self, sessions: dict[Any, TmuxSessionState]) -> None:
+    def load_raw(self) -> dict[str, Any]:
+        """Return parsed state.json as dict, or {} when the store is poisoned."""
+        return self.load().raw
+
+    def save(self, sessions: dict[Any, TmuxSessionState]) -> bool:
         """Atomic write: tmp + os.replace() so a crash between write and rename
         leaves the previous valid state.json intact. A direct write_text
         truncates the target file first — a crash then yields a partial
@@ -163,30 +215,198 @@ class StateStore:
         cannot be a dict key in JSON — we serialise "chat_id:thread_id".
 
         Top-level keys owned by other writers (currently `codex_sessions`,
-        written by `CodexSessionManager._persist`) are carried over from the
-        file on disk. Rebuilding `data` from scratch used to clobber them, so
-        any tmux save silently wiped every persisted codex thread mapping and
-        codex topics came back from a restart with no thread to resume.
+        written by `CodexSessionManager._persist`) survive because the merge
+        starts from the on-disk `raw` dict. Rebuilding `data` from scratch used
+        to clobber them, so any tmux save silently wiped every persisted codex
+        thread mapping and codex topics came back from a restart with no thread
+        to resume.
         """
-        data: dict[str, Any] = {}
-        on_disk = self.load_raw()
-        for reserved_key in _FOREIGN_STATE_KEYS:
-            if reserved_key in on_disk:
-                data[reserved_key] = on_disk[reserved_key]
-        for channel_key, state in sessions.items():
-            key_str = f"{channel_key[0]}:{channel_key[1]}"
-            data[key_str] = asdict(state)
-
-        tmp_path = self._state_path.with_suffix(self._state_path.suffix + ".tmp")
         with self._write_lock:
-            self._state_path.parent.mkdir(parents=True, exist_ok=True)
             try:
-                tmp_path.write_text(json.dumps(data, indent=2))
-                os.replace(tmp_path, self._state_path)
+                with self._file_lock():
+                    raw, poisoned = self._read_current_raw_under_lock()
+                    if poisoned:
+                        logger.warning(
+                            "Refusing to save tmux state because durable state is poisoned"
+                        )
+                        return False
+                    data = self._merge_live_sessions(raw, sessions)
+                    self._backup_if_significant_change(raw, data)
+                    self._atomic_write_json(data)
+                    return True
             except Exception:
                 logger.warning("Failed to save tmux state", exc_info=True)
+                return False
+
+    def remove(self, channel_key: Any, *, reason: str) -> bool:
+        """Explicitly remove a durable entry. Runtime failures must not call this."""
+        key_str = f"{channel_key[0]}:{channel_key[1]}"
+        with self._write_lock:
+            try:
+                with self._file_lock():
+                    raw, poisoned = self._read_current_raw_under_lock()
+                    if poisoned:
+                        logger.warning(
+                            "Refusing to remove tmux state for %s because durable state is "
+                            "poisoned",
+                            key_str,
+                        )
+                        return False
+                    if key_str not in raw:
+                        return True
+                    data = dict(raw)
+                    data.pop(key_str, None)
+                    self._write_history(key_str, reason)
+                    self._backup_raw(raw)
+                    self._atomic_write_json(data)
+                    return True
+            except Exception:
+                logger.warning("Failed to remove tmux state for %s", key_str, exc_info=True)
+                return False
+
+    @contextmanager
+    def _file_lock(self) -> Iterator[None]:
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self._state_path.with_suffix(self._state_path.suffix + ".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _atomic_write_json(self, data: dict[str, Any]) -> None:
+        tmp_path = self._state_path.with_name(
+            f"{self._state_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            fd = os.open(tmp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            # Close fd manually only when fdopen itself fails: once fdopen
+            # succeeds the file object owns the fd, and an extra os.close after
+            # `with` would double-close — possibly killing an fd another thread
+            # already reused.
+            try:
+                f = os.fdopen(fd, "w", encoding="utf-8")
+            except Exception:
                 with contextlib.suppress(OSError):
-                    tmp_path.unlink()
+                    os.close(fd)
+                raise
+            with f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self._state_path)
+            self._fsync_dir(self._state_path.parent)
+        except Exception:
+            logger.warning("Failed to save tmux state", exc_info=True)
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+            raise
+
+    def _read_current_raw_under_lock(self) -> tuple[dict[str, Any], bool]:
+        if self._poisoned:
+            return {}, True
+        if not self._state_path.exists():
+            return {}, False
+        try:
+            raw = json.loads(self._state_path.read_text())
+            if not isinstance(raw, dict):
+                raise ValueError("tmux state top-level JSON is not an object")
+        except Exception:
+            logger.warning("Failed to load tmux state during save", exc_info=True)
+            self._poisoned = True
+            self._backup_unreadable_state()
+            return {}, True
+        return raw, False
+
+    def _merge_live_sessions(
+        self,
+        raw: dict[str, Any],
+        sessions: dict[Any, TmuxSessionState],
+    ) -> dict[str, Any]:
+        data = dict(raw)
+        for channel_key, state in sessions.items():
+            key_str = f"{channel_key[0]}:{channel_key[1]}"
+            previous = data.get(key_str)
+            merged = dict(previous) if isinstance(previous, dict) else {}
+            merged.update(asdict(state))
+            data[key_str] = merged
+        return data
+
+    def _backup_if_significant_change(self, before: dict[str, Any], after: dict[str, Any]) -> None:
+        if not before:
+            return
+        if set(before) - set(after):
+            self._backup_raw(before)
+            return
+        for key, old_entry in before.items():
+            new_entry = after.get(key)
+            if not isinstance(old_entry, dict) or not isinstance(new_entry, dict):
+                if old_entry != new_entry:
+                    self._backup_raw(before)
+                    return
+                continue
+            if any(
+                old_entry.get(field) != new_entry.get(field) for field in _SIGNIFICANT_BACKUP_FIELDS
+            ):
+                self._backup_raw(before)
+                return
+
+    def _backup_unreadable_state(self) -> None:
+        with contextlib.suppress(OSError):
+            raw_text = self._state_path.read_text()
+            self._write_backup_text(raw_text)
+
+    def _backup_raw(self, raw: dict[str, Any]) -> None:
+        self._write_backup_text(json.dumps(raw, indent=2))
+
+    def _write_backup_text(self, text: str) -> None:
+        backup_dir = self._state_path.parent / "state.backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / f"state-{time.time_ns()}.json"
+        fd = os.open(backup_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        self._prune_backups(backup_dir)
+        self._fsync_dir(backup_dir)
+
+    @staticmethod
+    def _prune_backups(backup_dir: Path) -> None:
+        backups = sorted(
+            (path for path in backup_dir.glob("state-*.json") if path.is_file()),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        total = 0
+        for idx, path in enumerate(backups):
+            size = path.stat().st_size
+            total += size
+            if idx >= 10 or total > 5 * 1024 * 1024:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+
+    def _write_history(self, key_str: str, reason: str) -> None:
+        history_path = self._state_path.parent / "state.history.jsonl"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        event = {"ts": time.time(), "key": key_str, "reason": reason}
+        fd = os.open(history_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    @staticmethod
+    def _fsync_dir(path: Path) -> None:
+        with contextlib.suppress(OSError):
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
 
 def peek_saved_session(store: StateStore, channel_key: ChannelKey, cwd: str) -> str | None:
@@ -209,11 +429,11 @@ def peek_saved_session(store: StateStore, channel_key: ChannelKey, cwd: str) -> 
     """
     if not store.exists():
         return None
-    try:
-        raw = json.loads(store.path.read_text())
-    except Exception:
-        logger.warning("peek_saved_session: state.json unreadable", exc_info=True)
+    result = store.load()
+    if not result.ok:
+        logger.warning("peek_saved_session: state.json unreadable; refusing lazy resume")
         return None
+    raw = result.raw
 
     key_str = f"{channel_key[0]}:{channel_key[1]}"
     entry = raw.get(key_str) if isinstance(raw, dict) else None
@@ -275,23 +495,18 @@ def scan_orphan_tmux_sessions(state_path: Path) -> list[str]:
     TmuxManager is instantiated.
     """
     state_markers: dict[str, str] = {}
-    if state_path.exists():
-        try:
-            raw = json.loads(state_path.read_text())
-        except Exception:
-            logger.debug("scan_orphan_tmux_sessions: state.json unreadable", exc_info=True)
-            raw = {}
-        if isinstance(raw, dict):
-            for entry in raw.values():
-                if not isinstance(entry, dict):
-                    continue
-                name = entry.get("session_name")
-                if not isinstance(name, str):
-                    continue
-                state_markers[name] = entry.get("runner_version", "stream-json-legacy")
+    state_result = StateStore(state_path).load()
+    if state_result.ok:
+        for entry in state_result.raw.values():
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("session_name")
+            if not isinstance(name, str):
+                continue
+            state_markers[name] = entry.get("runner_version", "stream-json-legacy")
 
     try:
-        result = subprocess.run(
+        tmux_result = subprocess.run(
             ["tmux", "ls", "-F", "#{session_name}"],
             capture_output=True,
             text=True,
@@ -303,12 +518,12 @@ def scan_orphan_tmux_sessions(state_path: Path) -> list[str]:
         logger.debug("scan_orphan_tmux_sessions: tmux ls failed", exc_info=True)
         return []
 
-    if result.returncode != 0:
-        logger.debug("scan_orphan_tmux_sessions: tmux ls returncode=%d", result.returncode)
+    if tmux_result.returncode != 0:
+        logger.debug("scan_orphan_tmux_sessions: tmux ls returncode=%d", tmux_result.returncode)
         return []
 
     orphans: list[str] = []
-    for raw_name in result.stdout.splitlines():
+    for raw_name in tmux_result.stdout.splitlines():
         name = raw_name.strip()
         if not name or not name.startswith("cc-"):
             continue

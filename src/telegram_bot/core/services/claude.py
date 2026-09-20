@@ -36,22 +36,27 @@ from telegram_bot.core.services.cc_events import (
 )
 from telegram_bot.core.services.cc_modes import (
     _MODE_TOOLS,
-    BLOG_MODE_PROMPT,
-    BLOG_MODE_TOOLS,
     DEFAULT_MODE,
     FREE_MODE_PROMPT,
     FREE_MODE_TOOLS,
-    KNOWLEDGE_MODE_PROMPT,
-    KNOWLEDGE_MODE_TOOLS,
-    PROJECT_MODE_PROMPT,
-    PROJECT_MODE_TOOLS,
     TASK_MODE_PROMPT,
     TASK_MODE_TOOLS,
     Mode,
     _get_mode_prompt,
 )
-from telegram_bot.core.services.codex_mcp import build_codex_mcp_config_args
-from telegram_bot.core.services.providers import CODEX_ADAPTER, ExecCommand, choose_available_engine
+from telegram_bot.core.services.codex_mcp import (
+    build_codex_mcp_config_args,
+    discover_codex_mcp_server_names,
+)
+from telegram_bot.core.services.process_cleanup import tagged_processes, terminate_processes
+from telegram_bot.core.services.providers import (
+    CODEX_ADAPTER,
+    ExecCommand,
+    agent_process_env,
+    choose_available_engine,
+    claude_binary,
+    codex_process_env,
+)
 from telegram_bot.core.services.topic_runtime import BotDefaults, resolve_topic_runtime_config
 from telegram_bot.core.types import ChannelKey
 
@@ -64,15 +69,9 @@ logger = logging.getLogger(__name__)
 # (tmux_manager, streaming, handlers/*) use these names; listing them
 # in __all__ makes the re-export explicit for mypy.
 __all__ = [
-    "BLOG_MODE_PROMPT",
-    "BLOG_MODE_TOOLS",
     "DEFAULT_MODE",
     "FREE_MODE_PROMPT",
     "FREE_MODE_TOOLS",
-    "KNOWLEDGE_MODE_PROMPT",
-    "KNOWLEDGE_MODE_TOOLS",
-    "PROJECT_MODE_PROMPT",
-    "PROJECT_MODE_TOOLS",
     "TASK_MODE_PROMPT",
     "TASK_MODE_TOOLS",
     "TOOL_STATUS_MAP",
@@ -144,6 +143,20 @@ def _provider_from_session_id(session_id: str) -> str:
         return "claude"
 
 
+def _resolve_workspace_path(settings: object, value: str | Path) -> Path:
+    """Resolve a live path while tolerating legacy test/downstream settings doubles."""
+    resolver = getattr(settings, "resolve_workspace_path", None)
+    if callable(resolver):
+        resolved = resolver(value)
+        if isinstance(resolved, str | Path):
+            return Path(resolved)
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    root = Path(str(getattr(settings, "project_root", ".")))
+    return root / path
+
+
 class SessionManager:
     def __init__(
         self,
@@ -155,10 +168,14 @@ class SessionManager:
         self._sessions: dict[ChannelKey, SessionData] = {}
         self._cleanup_task: asyncio.Task[None] | None = None
         self._msg_sessions: collections.OrderedDict[int, object] = collections.OrderedDict()
-        self._mapping_path = Path(settings.session_mapping_path)
+        self._mapping_path = _resolve_workspace_path(settings, settings.session_mapping_path)
         # Persisted channel_key → session_id: lets bot resume CC session after restart
         self._channel_sessions: dict[str, object] = {}
-        self._channel_sessions_path = self._mapping_path.with_name("channel_sessions.json")
+        self._channel_sessions_path = (
+            _resolve_workspace_path(settings, settings.channel_sessions_path)
+            if settings.channel_sessions_path
+            else self._mapping_path.with_name("channel_sessions.json")
+        )
         # Channels where next message should ignore reply-to-resume (set after kill/reset)
         self._fresh_channels: set[str] = set()
         # Copy of the module-level _MODE_TOOLS so instance-scoped extensions
@@ -166,19 +183,24 @@ class SessionManager:
         self._mode_tools: dict[str, str] = dict(_MODE_TOOLS)
 
     def extend_mode_tools(self, extensions: dict[str, list[str]]) -> None:
-        """Append tool names to the allowedTools list of one or more modes.
+        """Register or extend application-owned allowedTools policies.
 
         Used by private bot entry points to attach assistant-specific MCP
         tools that must not live in the public core.
         """
         for mode, tools in extensions.items():
-            if mode not in self._mode_tools:
-                raise ValueError(f"Unknown mode: {mode!r}")
             if not tools:
                 continue
-            current = self._mode_tools[mode]
+            current = self._mode_tools.get(mode, "")
             addition = ",".join(tools)
             self._mode_tools[mode] = f"{current},{addition}" if current else addition
+
+    def mode_tools(self, mode: str) -> str:
+        """Return the effective allowedTools policy for a registered mode."""
+        try:
+            return self._mode_tools[mode]
+        except KeyError:
+            raise ValueError(f"Unknown mode: {mode!r}") from None
 
     @staticmethod
     def extend_tool_status_map(extensions: dict[str, str]) -> None:
@@ -218,19 +240,19 @@ class SessionManager:
         """
         configured = Path(self._settings.file_cache_dir)
         if not configured.is_absolute():
-            configured = Path(self._settings.project_root) / configured
+            configured = self._settings.workspace_root_path / configured
         return str(configured.resolve())
 
     def default_mcp_config_path(self) -> str:
         """Default MCP config path used by bot-launched sessions."""
-        return str(default_bot_mcp_config(self._settings.project_root))
+        return str(default_bot_mcp_config(self._settings.app_root_path))
 
     def _default_cwd(self) -> Path:
         """Default agent working directory, resolved relative to project_root."""
         configured = Path(self._settings.default_cwd)
         if configured.is_absolute():
             return configured
-        return Path(self._settings.project_root) / configured
+        return self._settings.workspace_root_path / configured
 
     @staticmethod
     def _ch_key(channel_key: ChannelKey) -> str:
@@ -263,13 +285,18 @@ class SessionManager:
         thread_id = channel_key[1]
         if self._topic_config is None or thread_id is None:
             return
+        # A locked session means a stream is in flight — mutating engine/model/
+        # cwd mid-stream corrupts retry and session-save logic. The next prompt
+        # acquires the lock after _get_session, so it still picks up fresh config.
+        if session.lock.locked():
+            return
 
         topic = self._topic_config.get_topic(thread_id)
         runtime = resolve_topic_runtime_config(
             topic,
             BotDefaults(
                 cwd=self._default_cwd(),
-                mcp_config=Path(self._settings.project_root) / ".mcp.bot.json",
+                mcp_config=Path(self.default_mcp_config_path()),
             ),
         )
         session.mode = runtime.mode
@@ -285,7 +312,7 @@ class SessionManager:
             session = SessionData(
                 mode="free",
                 cwd=str(self._default_cwd()),
-                mcp_config=str(Path(self._settings.project_root) / ".mcp.bot.json"),
+                mcp_config=self.default_mcp_config_path(),
                 chat_id=channel_key[0],
                 thread_id=channel_key[1],
             )
@@ -320,6 +347,15 @@ class SessionManager:
         # Apply on every lookup — picks up live edits to topic_config.json.
         self._apply_topic_config(self._sessions[channel_key], channel_key)
         return self._sessions[channel_key]
+
+    def has_active_provider_process(self, provider: str) -> bool:
+        """True when a subprocess session for ``provider`` is still running."""
+        for session in self._sessions.values():
+            if session.engine != provider or session.process is None:
+                continue
+            if session.process.returncode is None:
+                return True
+        return False
 
     async def _kill_process(self, process: asyncio.subprocess.Process) -> None:
         """Kill a CC subprocess and its process group immediately via SIGKILL."""
@@ -363,11 +399,12 @@ class SessionManager:
         mcp_config: str = "",
         chat_id: int = 0,
         thread_id: int | None = None,
+        model: str | None = None,
     ) -> list[str]:
         """Build claude CLI command with mode-specific prompts, tools, and mcp-config."""
-        mcp_path = mcp_config or str(Path(self._settings.project_root) / ".mcp.bot.json")
+        mcp_path = mcp_config or self.default_mcp_config_path()
         base = [
-            "claude",
+            claude_binary(),
             "--output-format",
             "stream-json",
             "--verbose",
@@ -381,6 +418,8 @@ class SessionManager:
             "--max-turns",
             str(self._settings.cc_max_turns),
         ]
+        if model:
+            base.extend(["--model", model])
         # Only attach an MCP config when the file exists. CC fails fast with
         # "Invalid MCP configuration" if --mcp-config points at a missing path,
         # which would block the bot for any user without an .mcp.bot.json.
@@ -431,8 +470,10 @@ class SessionManager:
                     session.mcp_config,
                     session.chat_id,
                     session.thread_id,
+                    session.model,
                 ),
                 cwd=cwd,
+                env=agent_process_env(binary=claude_binary()),
             )
 
         output_dir = Path(self.file_cache_dir) / "codex-last-message"
@@ -442,13 +483,20 @@ class SessionManager:
         output_path = output_dir / f"{session.chat_id}-{session.thread_id}-{time.time_ns()}.txt"
         with contextlib.suppress(FileNotFoundError):
             output_path.unlink()
+        codex_env = codex_process_env()
+        codex_home = Path(codex_env.get("CODEX_HOME", Path.home() / ".codex"))
+        inherited_servers = discover_codex_mcp_server_names(cwd, codex_home=codex_home)
+        mcp_args = build_codex_mcp_config_args(
+            session.mcp_config,
+            inherited_server_names=inherited_servers,
+        )
 
         if session.session_id:
             argv = [
                 CODEX_ADAPTER.binary(),
                 "exec",
                 "resume",
-                *build_codex_mcp_config_args(session.mcp_config),
+                *mcp_args,
                 session.session_id,
                 "--json",
                 "--skip-git-repo-check",
@@ -461,7 +509,7 @@ class SessionManager:
             argv = [
                 CODEX_ADAPTER.binary(),
                 "exec",
-                *build_codex_mcp_config_args(session.mcp_config),
+                *mcp_args,
                 "--json",
                 "--cd",
                 cwd,
@@ -485,6 +533,7 @@ class SessionManager:
                 session.thread_id,
             ),
             output_last_message_path=output_path,
+            env=codex_env,
         )
 
     def build_tmux_startup_args(
@@ -494,6 +543,7 @@ class SessionManager:
         *,
         session_id_new: str | None = None,
         resume_session_id: str | None = None,
+        model: str | None = None,
     ) -> list[str]:
         """Build CC TUI startup args for persistent tmux session.
 
@@ -530,14 +580,14 @@ class SessionManager:
                 "build_tmux_startup_args: pass exactly one of "
                 "session_id_new (new session) or resume_session_id (existing transcript)"
             )
-        mcp_path = mcp_config or str(Path(self._settings.project_root) / ".mcp.bot.json")
+        mcp_path = mcp_config or self.default_mcp_config_path()
         if session_id_new is not None:
             session_flag = ["--session-id", session_id_new]
         else:
             assert resume_session_id is not None  # narrowing for mypy
             session_flag = ["--resume", resume_session_id]
         cmd = [
-            "claude",
+            claude_binary(),
             *session_flag,
             "--dangerously-skip-permissions",
             # in-process keeps only the team lead visible in the tmux window
@@ -554,6 +604,8 @@ class SessionManager:
             "--max-turns",
             str(self._settings.cc_max_turns),
         ]
+        if model:
+            cmd.extend(["--model", model])
         if Path(mcp_path).exists():
             cmd.extend(["--mcp-config", mcp_path, "--strict-mcp-config"])
         return cmd
@@ -597,7 +649,7 @@ class SessionManager:
         self,
         prompt: str,
         session: SessionData,
-        on_event: Callable[[StreamEvent], Awaitable[None] | None],
+        on_event: Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
     ) -> str:
         """Run a CC subprocess, stream events via on_event, return final result."""
         session_id = session.session_id
@@ -619,7 +671,7 @@ class SessionManager:
                 base_mcp_config=original_mcp_config or self.default_mcp_config_path(),
                 channel_key=(session.chat_id, session.thread_id),
                 runtime_path=runtime_mcp_path,
-                project_root=self._settings.project_root,
+                project_root=self._settings.app_root_path,
             )
             exec_cmd = self._build_exec_command(prompt, session)
         except Exception:
@@ -643,6 +695,17 @@ class SessionManager:
                 with contextlib.suppress(OSError):
                     runtime_mcp_path.unlink()
 
+        async def cleanup_runtime_mcp_processes() -> None:
+            if runtime_mcp_path is None:
+                return
+            processes = await asyncio.to_thread(
+                tagged_processes,
+                channel_key=(session.chat_id, session.thread_id),
+                runtime_path=str(runtime_mcp_path),
+            )
+            if processes:
+                await asyncio.to_thread(terminate_processes, processes)
+
         logger.info(
             "Running agent stream: provider=%s resume=%s, mode=%s, cwd=%s, session_id=%s",
             session.engine,
@@ -661,6 +724,7 @@ class SessionManager:
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,
                     cwd=cwd,
+                    env=exec_cmd.env,
                     limit=10
                     * 1024
                     * 1024,  # 10MB line buffer (CC embeds base64 PDFs in stream JSON)
@@ -694,6 +758,7 @@ class SessionManager:
                 process.stdin.close()
             except (BrokenPipeError, ConnectionError):
                 await self._kill_process(process)
+                await cleanup_runtime_mcp_processes()
                 async with session.process_lock:
                     if session.process is process:
                         session.process = None
@@ -725,6 +790,7 @@ class SessionManager:
         except TimeoutError:
             logger.warning("CC stream timed out after %ds", self._settings.cc_query_timeout_sec)
             await self._kill_process(process)
+            await cleanup_runtime_mcp_processes()
             async with session.process_lock:
                 if session.process is process:
                     session.process = None
@@ -736,6 +802,15 @@ class SessionManager:
             cleanup_runtime_mcp_config()
             raise CCTimeoutError from None
         except Exception:
+            # Same teardown as the timeout branch: without the kill the CC
+            # subprocess survives the exception as an orphan, and the stale
+            # session.process reference makes the next prompt think a stream
+            # is still running.
+            await self._kill_process(process)
+            await cleanup_runtime_mcp_processes()
+            async with session.process_lock:
+                if session.process is process:
+                    session.process = None
             if stderr_task is not None:
                 stderr_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -753,6 +828,7 @@ class SessionManager:
                 self._settings.cc_wait_timeout_sec,
             )
             await self._kill_process(process)
+            await cleanup_runtime_mcp_processes()
             async with session.process_lock:
                 if session.process is process:
                     session.process = None
@@ -780,6 +856,7 @@ class SessionManager:
                 cleanup_runtime_mcp_config()
                 raise CCProcessError(process.returncode or -1)
         cleanup_output_last_message()
+        await cleanup_runtime_mcp_processes()
         cleanup_runtime_mcp_config()
 
         if process.returncode and process.returncode != 0 and not result_text:
@@ -804,10 +881,96 @@ class SessionManager:
 
         return result_text
 
+    async def run_captured_prompt(
+        self,
+        prompt: str,
+        *,
+        mode: Mode,
+        mcp_config: str,
+        session_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        """Run one isolated Claude prompt and capture final text plus session id.
+
+        The application owns the mode policy, MCP config validation, and returned
+        session id. This path does not attach the bot MCP server or mutate the
+        channel-keyed session store.
+        """
+        self.mode_tools(mode)
+        cmd = self._build_command(prompt, session_id, mode=mode, mcp_config=mcp_config)
+        process_env = agent_process_env(binary=claude_binary())
+        process_env.update(
+            {
+                "APP_ROOT": str(self._settings.app_root_path),
+                "AGENT_WORKSPACE_ROOT": str(self._settings.workspace_root_path),
+                "PROJECT_ROOT": str(self._settings.workspace_root_path),
+            }
+        )
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            cwd=self._settings.workspace_root_path,
+            env=process_env,
+            limit=10 * 1024 * 1024,
+        )
+
+        stderr_buffer: collections.deque[str] = collections.deque(maxlen=256)
+
+        async def drain_stderr() -> None:
+            if process.stderr is None:
+                return
+            while True:
+                chunk = await process.stderr.read(4096)
+                if not chunk:
+                    break
+                stderr_buffer.append(chunk.decode(errors="replace"))
+
+        async def _discard(_event: StreamEvent) -> None:
+            return None
+
+        stderr_task = asyncio.create_task(drain_stderr())
+        try:
+            result_text, new_session_id = await asyncio.wait_for(
+                self._read_stream(process, _discard, provider="claude"),
+                timeout=self._settings.cc_query_timeout_sec,
+            )
+        except TimeoutError:
+            await self._kill_process(process)
+            stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stderr_task
+            raise CCTimeoutError from None
+        except BaseException:
+            await self._kill_process(process)
+            stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stderr_task
+            raise
+
+        try:
+            await asyncio.wait_for(process.wait(), timeout=self._settings.cc_wait_timeout_sec)
+        except TimeoutError:
+            await self._kill_process(process)
+        with contextlib.suppress(asyncio.CancelledError):
+            await stderr_task
+
+        stderr_text = "".join(stderr_buffer)
+        if stderr_text:
+            logger.info("Captured CC stderr:\n%s", stderr_text[-2000:])
+        if process.returncode and process.returncode != 0 and not result_text:
+            logger.warning(
+                "Captured CC exited code %d, stderr: %s",
+                process.returncode,
+                stderr_text[-500:] or "(empty)",
+            )
+            raise CCProcessError(process.returncode)
+        return result_text, new_session_id
+
     async def _read_stream(
         self,
         process: asyncio.subprocess.Process,
-        on_event: Callable[[StreamEvent], Awaitable[None] | None],
+        on_event: Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
         provider: str = "claude",
     ) -> tuple[str, str | None]:
         """Read stream-json lines from process stdout, dispatch events.
@@ -886,7 +1049,10 @@ class SessionManager:
                 idle_start = None
                 continue
 
-            if event_type in ("system", "assistant", "result"):
+            # "user" events are tool results streamed back by CC — a long
+            # tool-heavy run can emit only those for minutes; they prove the
+            # process is alive and must reset the inactivity timer too.
+            if event_type in ("system", "assistant", "user", "result"):
                 idle_start = None
                 continue
 
@@ -899,7 +1065,7 @@ class SessionManager:
         self,
         channel_key: ChannelKey,
         prompt: str,
-        on_event: Callable[[StreamEvent], Awaitable[None] | None],
+        on_event: Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
         *,
         on_engine_changed: Callable[[str], Awaitable[None]] | None = None,
         attachments: list[Path] | None = None,
@@ -1007,8 +1173,13 @@ class SessionManager:
                         # Kill old process before retry to prevent zombie processes
                         if session.process is not None:
                             await self._kill_process(session.process)
-                        # SIGTERM without cancel — preserve session for retry
-                        if isinstance(exc, CCProcessError) and exc.exit_code == 143:
+                        # SIGTERM without cancel — preserve session for retry.
+                        # asyncio reports signal death as a negative returncode
+                        # (-15 for SIGTERM); 143 covers shell-wrapped exits.
+                        if isinstance(exc, CCProcessError) and exc.exit_code in (
+                            143,
+                            -signal.SIGTERM,
+                        ):
                             logger.info(
                                 "SIGTERM, preserving session_id=%s for retry",
                                 session.session_id,
@@ -1363,20 +1534,28 @@ class SessionManager:
             if isinstance(data, dict):
                 migrated = 0
                 for k, v in data.items():
-                    if isinstance(v, str):
-                        self._msg_sessions[int(k)] = v
-                    elif isinstance(v, dict) and "session_id" in v:
-                        self._msg_sessions[int(k)] = {
-                            "provider": str(v.get("provider", "claude")),
-                            "session_id": str(v["session_id"]),
-                            "channel_key": str(v.get("channel_key", "")),
-                            "model": v.get("model") if isinstance(v.get("model"), str) else None,
-                        }
-                    elif isinstance(v, dict) and "s" in v:
-                        # Old dict format: extract session_id
-                        self._msg_sessions[int(k)] = str(v["s"])
-                        migrated += 1
-                    else:
+                    # Per-entry guard: one malformed key (e.g. non-numeric)
+                    # must not abort the load and silently drop the rest of
+                    # the mapping — that loses resume for every later message.
+                    try:
+                        if isinstance(v, str):
+                            self._msg_sessions[int(k)] = v
+                        elif isinstance(v, dict) and "session_id" in v:
+                            self._msg_sessions[int(k)] = {
+                                "provider": str(v.get("provider", "claude")),
+                                "session_id": str(v["session_id"]),
+                                "channel_key": str(v.get("channel_key", "")),
+                                "model": (
+                                    v.get("model") if isinstance(v.get("model"), str) else None
+                                ),
+                            }
+                        elif isinstance(v, dict) and "s" in v:
+                            # Old dict format: extract session_id
+                            self._msg_sessions[int(k)] = str(v["s"])
+                            migrated += 1
+                        else:
+                            logger.debug("Skipping invalid mapping entry: %s -> %s", k, v)
+                    except (ValueError, TypeError):
                         logger.debug("Skipping invalid mapping entry: %s -> %s", k, v)
                 logger.info(
                     "Loaded %d message→session mappings (%d migrated from old format)",
@@ -1416,18 +1595,32 @@ class SessionManager:
                     "Failed to load channel sessions from %s", self._channel_sessions_path
                 )
 
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: object) -> None:
+        """Write JSON atomically: temp file in the same dir + os.replace.
+
+        A crash mid-write must not leave a truncated file — these mappings
+        are the only way to resume sessions after restart.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, json.dumps(payload).encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+
     def _save_channel_sessions(self) -> None:
         """Write channel→session mapping to disk (called after each stream and on shutdown)."""
         try:
-            self._channel_sessions_path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(
-                str(self._channel_sessions_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
-            )
-            try:
-                os.write(fd, json.dumps(self._channel_sessions).encode())
-            finally:
-                os.close(fd)
-            os.chmod(self._channel_sessions_path, 0o600)
+            self._atomic_write_json(self._channel_sessions_path, self._channel_sessions)
         except OSError:
             logger.warning(
                 "Failed to save channel sessions to %s",
@@ -1438,15 +1631,8 @@ class SessionManager:
     def save_mapping(self) -> None:
         """Save message→session and channel→session mappings to JSON files."""
         try:
-            self._mapping_path.parent.mkdir(parents=True, exist_ok=True)
             data = {str(k): v for k, v in self._msg_sessions.items()}
-            # Create with 0600 (avoids TOCTOU window for new files), chmod for existing
-            fd = os.open(str(self._mapping_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            try:
-                os.write(fd, json.dumps(data).encode())
-            finally:
-                os.close(fd)
-            os.chmod(self._mapping_path, 0o600)
+            self._atomic_write_json(self._mapping_path, data)
             logger.info("Saved %d message→session mappings", len(data))
         except OSError:
             logger.warning(
