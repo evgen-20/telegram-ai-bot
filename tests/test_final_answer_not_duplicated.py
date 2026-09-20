@@ -9,6 +9,7 @@ that answer twice — once plain as "progress", once through
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -106,3 +107,47 @@ async def test_markdown_table_answer_is_delivered_once_as_rich() -> None:
     sent = await _run([table], table)
     assert len(sent) == 1
     assert "<table>" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_held_back_block_is_flushed_when_the_turn_is_cancelled() -> None:
+    """/cancel must not swallow the last block the agent already produced."""
+    sends: list[str] = []
+    session_manager = MagicMock()
+    session_manager.get_mode.return_value = "free"
+    session_manager.override_session = AsyncMock()
+    session_manager.record_message_session = MagicMock()
+    session_manager.get_current_session_id.return_value = "sid"
+
+    async def send_stream(
+        _key: tuple[int, int | None],
+        _prompt: str,
+        on_event: Callable[[StreamEvent], Awaitable[None]],
+        **_: Any,
+    ) -> str:
+        await on_event(StreamEvent("text", "Первый кусок"))
+        await on_event(StreamEvent("text", "Второй кусок"))
+        await asyncio.sleep(10)  # the user cancels here
+        return "never reached"
+
+    session_manager.send_stream = send_stream
+
+    task = asyncio.create_task(
+        send_streaming_response(
+            _message(sends),
+            session_manager,
+            (-100, None),
+            "prompt",
+            tmux_manager=None,
+            topic_config=None,
+        )
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [text for text in sends if not text.startswith(_THINKING)] == [
+        "Первый кусок",
+        "Второй кусок",
+    ]

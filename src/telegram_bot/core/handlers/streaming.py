@@ -1016,7 +1016,14 @@ async def send_streaming_response(
                 attachments=attachments,
             )
     except asyncio.CancelledError:
-        # Status messages ARE the history — no cleanup needed
+        # Status messages ARE the history — no cleanup needed, with one
+        # exception: the held-back text block. `_resolve_pending_text` never
+        # runs on this path, so without an explicit flush the last thing the
+        # agent produced before /cancel would vanish. Shielded because this
+        # task is already cancelling; failures here must not mask the cancel.
+        if ctx.pending_text is not None:
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.shield(_flush_pending_text(ctx))
         raise
     finally:
         # Close the non-tmux live buffer if we owned one. In tmux mode the
