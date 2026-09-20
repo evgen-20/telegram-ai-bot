@@ -73,3 +73,49 @@ processes without relying on private paths.
 Operational commands include `/recycle` for restarting a stuck tmux runtime
 while preserving resumable context when possible, and `/mcpstatus` for redacted
 MCP process diagnostics in the current topic.
+
+## Codex backend: app-server, not tmux (fork divergence)
+
+Upstream drives Codex the same way it drives Claude Code — a CLI in a tmux
+pane, scraped through the TUI, or a one-shot subprocess. This fork keeps that
+code (it is still the Claude path, and the Codex subprocess path is still
+reachable for `exec_mode: subprocess`), but a topic with `engine: codex` and
+`exec_mode: tmux` is served by a Codex **app-server** instead:
+
+- `core/services/codex_app_server.py` - JSON-RPC client over a
+  `codex app-server --listen stdio://` subprocess; auto-answers approval
+  requests.
+- `core/services/codex_daemon.py` - best-effort start of the singleton
+  `codex app-server daemon`; the bot works without it.
+- `core/services/codex_events.py` - maps Codex notifications onto the same
+  `StreamEvent` stream the Claude path emits, so stream modes, live buffers,
+  and final-answer rendering are shared.
+- `core/services/codex_session_manager.py` - per-channel thread lifecycle
+  (start/resume/cancel/clear/restore), image snapshotting, wedged-client
+  recycling.
+- `core/services/session_backend.py` - the `SessionBackend` Protocol both
+  `TmuxManager` and `CodexSessionManager` satisfy, plus `BackendDispatcher`.
+
+Handlers never talk to `TmuxManager` for per-channel session state directly;
+they resolve a backend through `BackendDispatcher.for_engine(topic.engine)`.
+`TmuxManager` is still passed alongside it for infrastructure that has no
+Codex equivalent (live buffers, session snapshots, topic config).
+
+Consequences to keep in mind:
+
+- Codex state lives under the `codex_sessions` top-level key of the same
+  `state.json` the tmux backend writes. `StateStore.save()` merges into the
+  on-disk dict so the key survives; readers that treat every top-level key as
+  a channel key must skip `_FOREIGN_STATE_KEYS`.
+- Images go to Codex as `localImage` `UserInput` entries (`attachments=` on
+  `send_stream`), not as file paths in the prompt body. The Claude path accepts
+  and ignores the kwarg.
+- `TmuxManager.has_live_provider("codex")` is always false here, so anything
+  guarding on "is a Codex session live" must also ask
+  `CodexSessionManager.has_live_sessions()` - that is what the Codex CLI
+  auto-updater does, via `wire_codex_liveness_probe`.
+- `/recycle` and `/mcpstatus` remain tmux-only and answer "not active" in a
+  Codex topic; `/new`, `/clear`, `/kill`, `/cancel`, and `/resume` are
+  backend-routed and work for both.
+
+Protocol schemas vendored from the Codex CLI live in `docs/codex-protocol/`.
