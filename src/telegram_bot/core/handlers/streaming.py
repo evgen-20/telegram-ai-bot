@@ -449,6 +449,9 @@ class _StreamCtx:
     live_buffer: LiveStatusBuffer | None
     sent_message_ids: list[int]
     send_failed: bool = False
+    # Last non-tmux `text` event, held back until we know whether it is the
+    # turn's final answer. See `_handle_text_event`.
+    pending_text: str | None = None
 
 
 async def _send_status_silent(ctx: _StreamCtx, content: str) -> None:
@@ -583,14 +586,32 @@ async def _send_tmux_answer(ctx: _StreamCtx, content: str, *, label: str) -> boo
     return outcome.complete and (outcome.message_id is not None or bool(legacy_message_ids))
 
 
+async def _flush_pending_text(ctx: _StreamCtx) -> None:
+    """Send the held-back text block, if any, as an intermediate message."""
+    pending, ctx.pending_text = ctx.pending_text, None
+    if pending is None:
+        return
+    await _format_and_send_chunks(
+        ctx,
+        pending,
+        label=f"text {ctx.channel_key}",
+    )
+
+
 async def _handle_text_event(ctx: _StreamCtx, event: StreamEvent) -> None:
-    """Send verbose intermediate text as its own Telegram message."""
+    """Send verbose intermediate text as its own Telegram message.
+
+    Outside tmux the *last* text block is normally the turn's final answer,
+    which ``send_stream`` also returns and ``_send_final_response`` sends again
+    — with rich rendering and the topic keyboard. Sending each block as it
+    arrives therefore delivered that answer twice. Hold the newest block back
+    instead: an older block is flushed as soon as a newer one proves it was
+    only intermediate, and the last one is resolved after the stream ends
+    (see ``_resolve_pending_text``).
+    """
     if not ctx.used_tmux:
-        await _format_and_send_chunks(
-            ctx,
-            event.content,
-            label=f"text {ctx.channel_key}",
-        )
+        await _flush_pending_text(ctx)
+        ctx.pending_text = event.content
         return
 
     await _send_tmux_answer(
@@ -598,6 +619,14 @@ async def _handle_text_event(ctx: _StreamCtx, event: StreamEvent) -> None:
         event.content,
         label=f"text {ctx.channel_key}",
     )
+
+
+async def _resolve_pending_text(ctx: _StreamCtx, final_text: str) -> None:
+    """Drop the held-back block when ``_send_final_response`` will repeat it."""
+    if ctx.pending_text is not None and ctx.pending_text.strip() == final_text.strip():
+        ctx.pending_text = None
+        return
+    await _flush_pending_text(ctx)
 
 
 async def _handle_result_message_event(ctx: _StreamCtx, event: StreamEvent) -> bool:
@@ -1015,6 +1044,9 @@ async def send_streaming_response(
     # so no post-stream recording is needed here.
     final_text = response
     if not final_text:
+        # Nothing to conclude with — the held-back block is all the user gets.
+        await _flush_pending_text(ctx)
         return
 
+    await _resolve_pending_text(ctx, final_text)
     await _send_final_response(ctx, final_text)
