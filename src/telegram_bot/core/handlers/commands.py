@@ -120,10 +120,23 @@ def _format_codex_update_output(output: str) -> str:
 def _codex_update_active_check(
     tmux_manager: TmuxManager,
     session_manager: SessionManager,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> bool:
-    return tmux_manager.has_live_provider("codex") or session_manager.has_active_provider_process(
+    """True when replacing the codex CLI right now would break a live session.
+
+    Three places can hold one: a tmux pane (upstream's case, unused here), a
+    one-shot subprocess, and — in this fork — an app-server thread owned by
+    CodexSessionManager.
+    """
+    if tmux_manager.has_live_provider("codex") or session_manager.has_active_provider_process(
         "codex"
-    )
+    ):
+        return True
+    if backend_dispatcher is None:
+        return False
+    codex_backend = backend_dispatcher.for_engine("codex")
+    has_live = getattr(codex_backend, "has_live_sessions", None)
+    return bool(callable(has_live) and has_live())
 
 
 def _codex_update_result_message(result: CodexUpdateResult) -> str:
@@ -216,6 +229,7 @@ async def handle_codex_update(
     codex_update_service: CodexUpdateService,
     tmux_manager: TmuxManager,
     session_manager: SessionManager,
+    backend_dispatcher: BackendDispatcher | None = None,
 ) -> None:
     """Run or inspect the bot-managed Codex CLI updater."""
     text = message.text or ""
@@ -236,7 +250,9 @@ async def handle_codex_update(
 
     running = await message.answer(t("ui.codex_update_running"))
     result = await codex_update_service.run_manual(
-        active_check=lambda: _codex_update_active_check(tmux_manager, session_manager)
+        active_check=lambda: _codex_update_active_check(
+            tmux_manager, session_manager, backend_dispatcher
+        )
     )
     response = _codex_update_result_message(result)
     with contextlib.suppress(TelegramBadRequest):

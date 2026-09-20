@@ -231,6 +231,7 @@ async def _start() -> None:
     )
     codex_manager.restore_all()
     dispatcher = BackendDispatcher(claude=tmux_manager, codex=codex_manager)
+    tmux_manager.wire_codex_liveness_probe(codex_manager.has_live_sessions)
 
     picker_store = PickerStore()
     bot_defaults = BotDefaults(

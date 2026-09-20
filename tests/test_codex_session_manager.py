@@ -751,3 +751,38 @@ async def test_send_stream_recycles_client_on_turn_timeout(
     await mgr.send_stream(ch, "second message", on_event)
     assert len(spawned) == 2
     assert resume_calls == ["th-wedged", "th-wedged"]
+
+
+@pytest.mark.asyncio
+async def test_has_live_sessions_reports_app_server_threads(
+    daemon_mock: AsyncMock, tmp_path: Path
+) -> None:
+    """The codex updater must see app-server threads, not just tmux panes."""
+
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}")
+    mgr = CodexSessionManager(
+        daemon=daemon_mock,
+        state_path=state_path,
+        proxy_command_factory=lambda: ["bash", "-c", "cat"],
+    )
+    mgr._client_factory = _FakeClient  # type: ignore[assignment]
+
+    assert not mgr.has_live_sessions()
+
+    channel = (-100, 7)
+    await mgr.start_session(
+        channel,
+        mode="free",
+        cwd=str(tmp_path),
+        mcp_config="",
+        chat_id=channel[0],
+        session_manager=object(),
+    )
+
+    assert mgr.has_live_sessions()
+    # The channel about to be (re)spawned is excluded — it is the caller's own.
+    assert not mgr.has_live_sessions(exclude_channel=channel)
+
+    await mgr.kill(channel)
+    assert not mgr.has_live_sessions()

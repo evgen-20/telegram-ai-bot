@@ -182,6 +182,19 @@ class CodexSessionManager:
         s = self._sessions.get(channel_key)
         return bool(s and s.is_processing)
 
+    def has_live_sessions(self, *, exclude_channel: ChannelKey | None = None) -> bool:
+        """True when any channel holds a live codex thread.
+
+        The codex-update service must not replace the CLI underneath a running
+        thread. Upstream answers that question with
+        ``TmuxManager.has_live_provider("codex")``, which only sees codex
+        sessions running inside tmux — always none in this fork, where every
+        codex topic is served by this manager instead.
+        """
+        return any(
+            key != exclude_channel and state.is_active for key, state in self._sessions.items()
+        )
+
     def is_tailing(self, channel_key: ChannelKey) -> bool:
         # Codex streams notifications inline rather than tailing a transcript.
         # Telegram callers only use ``is_tailing`` to gate concurrent prompts,

@@ -310,6 +310,7 @@ class TmuxManager:
         self._transcript_lag_warned: set[ChannelKey] = set()
         self._transcript_last_offsets: dict[ChannelKey, int] = {}
         self._codex_update_service: object | None = None
+        self._codex_liveness_probe: Callable[[], bool] | None = None
 
     # --- Backwards-compatible accessors ---
 
@@ -347,6 +348,16 @@ class TmuxManager:
 
     def wire_codex_update_service(self, service: object) -> None:
         self._codex_update_service = service
+
+    def wire_codex_liveness_probe(self, probe: Callable[[], bool]) -> None:
+        """Register an extra "is a codex session live?" source.
+
+        `has_live_provider("codex")` only sees codex sessions inside tmux. This
+        fork runs codex through the app-server backend instead, so without this
+        probe the pre-spawn auto-update would happily replace the CLI under a
+        live codex thread.
+        """
+        self._codex_liveness_probe = probe
 
     def live_buffer_available(self) -> bool:
         """True if wire_live_buffer() has been called — buffers can be built."""
@@ -847,6 +858,12 @@ class TmuxManager:
             is_probe_blocked,
         )
 
+    def _codex_is_live(self, channel_key: ChannelKey) -> bool:
+        if self.has_live_provider("codex", exclude_channel=channel_key):
+            return True
+        probe = self._codex_liveness_probe
+        return bool(probe is not None and probe())
+
     async def _maybe_auto_update_codex(self, channel_key: ChannelKey) -> None:
         service = self._codex_update_service
         if service is None:
@@ -855,9 +872,7 @@ class TmuxManager:
         if run_auto is None:
             return
         try:
-            result = await run_auto(
-                active_check=lambda: self.has_live_provider("codex", exclude_channel=channel_key)
-            )
+            result = await run_auto(active_check=lambda: self._codex_is_live(channel_key))
         except Exception:
             logger.warning("Codex auto-update failed before tmux spawn", exc_info=True)
             return
