@@ -48,6 +48,8 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
 "src/telegram_bot/core/tui/modal_detect.py" = ["RUF001", "RUF002", "RUF003"]
 # audio.py emits Russian-language transcripts and status text by design.
 "src/telegram_bot/core/handlers/audio.py" = ["RUF001"]
+# Trust-dialog fixtures quote the CLI's own glyphs verbatim.
+"tests/test_public_runtime.py" = ["RUF001"]
 
 [tool.mypy]
 python_version = "3.12"
