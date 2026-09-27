@@ -53,3 +53,7 @@ data/.tmp/
 # MCP runtime configs (may contain credentials)
 .mcp.json
 .mcp.bot.json
+
+# Local git worktrees and agent plan workspaces
+.worktrees/
+.superpowers/
