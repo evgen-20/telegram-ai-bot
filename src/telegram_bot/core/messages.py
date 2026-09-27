@@ -196,6 +196,16 @@ MESSAGES: dict[str, dict[str, str]] = {
             "user that runs this bot. Install and sign in to agy, or pick another engine "
             "with /engine."
         ),
+        "ui.antigravity_location_error": (
+            "Antigravity refused the request: the Google account is not allowed from this "
+            "location. This is an account/region issue, not a bot error — check where the "
+            "account is signed in."
+        ),
+        "ui.antigravity_auth_error": (
+            "Antigravity is not signed in on this machine. Run agy once in a terminal and "
+            "complete the Google sign-in."
+        ),
+        "ui.antigravity_error": "Antigravity error: {error}",
         "ui.compacting": "⏳ Compacting context...",
         "ui.compact_done": "✅ Compacted: {pre:,} → {post:,} tokens",
         "ui.running_command": "⚙️ Running {command}...",
@@ -280,6 +290,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "tool.grep": "🔍 Searching",
         "tool.glob": "🔍 Finding files",
         "tool.bash": "⚙️ Running",
+        "tool.generate_image": "🎨 Generating image…",
+        "tool.search_web": "🌐 Searching the web",
         "tool.bash_with_cmd": "⚙️ Running: {cmd}",
         "tool.write": "✏️ Writing file",
         "tool.edit": "✏️ Editing",
@@ -475,6 +487,16 @@ MESSAGES: dict[str, dict[str, str]] = {
             "Linux-пользователя бота. Установи agy и войди в аккаунт или выбери другой "
             "движок через /engine."
         ),
+        "ui.antigravity_location_error": (
+            "Antigravity отклонил запрос: Google-аккаунт не допущен из этой локации. "
+            "Это проблема аккаунта или региона, а не бота — проверь, где ещё выполнен "
+            "вход в этот аккаунт."
+        ),
+        "ui.antigravity_auth_error": (
+            "Antigravity не авторизован на этой машине. Запусти agy в терминале и пройди "
+            "вход через Google."
+        ),
+        "ui.antigravity_error": "Ошибка Antigravity: {error}",
         "ui.inactivity_kill": "Зависло, попробуй ещё раз",
         "ui.voice_too_large": "Голосовое сообщение слишком большое (максимум 100 МБ).",
         "ui.voice_not_recognized": "Не удалось распознать голосовое сообщение",
@@ -502,6 +524,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "tool.grep": "🔍 Ищу",
         "tool.glob": "🔍 Ищу файлы",
         "tool.bash": "⚙️ Выполняю",
+        "tool.generate_image": "🎨 Генерирую картинку…",
+        "tool.search_web": "🌐 Ищу в интернете",
         "tool.bash_with_cmd": "⚙️ Выполняю: {cmd}",
         "tool.write": "✏️ Пишу файл",
         "tool.edit": "✏️ Редактирую",

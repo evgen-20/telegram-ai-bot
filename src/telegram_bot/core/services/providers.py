@@ -1067,6 +1067,25 @@ class CodexTranscriptParser:
 CODEX_ADAPTER = CodexAdapter()
 
 
+class AntigravityAdapter:
+    """Provider adapter for Antigravity CLI.
+
+    The implementation lives in ``services/antigravity.py``, which imports this
+    module; the methods import it lazily to keep the dependency one-way.
+    """
+
+    name: Engine = "antigravity"
+
+    def parse_exec_event(self, raw: str) -> ExecParseResult:
+        """Parse one stream-json line without run state (see AntigravityExecParser)."""
+        from telegram_bot.core.services.antigravity import AntigravityExecParser
+
+        return AntigravityExecParser().parse(raw)
+
+
+ANTIGRAVITY_ADAPTER = AntigravityAdapter()
+
+
 def is_engine_available(engine: str) -> bool:
     """Return whether the provider CLI can be spawned by the current process."""
     if engine == "claude":
