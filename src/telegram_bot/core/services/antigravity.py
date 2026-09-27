@@ -12,11 +12,13 @@ it — ``agy`` is exec'd and authenticates itself.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -445,3 +447,105 @@ class AntigravityTranscriptParser:
                 continue
             events.append(StreamEvent("image_message", str(path), turn_id=self._turn_id))
         return events
+
+
+# --- TUI pane state ----------------------------------------------------------
+
+_IDLE_FOOTER = "? for shortcuts"
+_BUSY_FOOTER = "esc to cancel"
+_TRUST_QUESTION = "Do you trust the contents of this project?"
+_TRUST_ACCEPT = "Yes, I trust this folder"
+_SELECTION_FOOTER = "↑/↓ Navigate"
+
+
+def _live_tail(pane: str, lines: int) -> str:
+    """The last *lines* non-blank lines — the part of the pane agy redraws."""
+    visible = [line for line in pane.splitlines() if line.strip()]
+    return "\n".join(visible[-lines:])
+
+
+def is_trust_dialog(pane: str) -> bool:
+    tail = _live_tail(pane, 12)
+    return _TRUST_QUESTION in tail and _TRUST_ACCEPT in tail
+
+
+def is_modal_present(pane: str) -> bool:
+    """A selection list (trust dialog, pickers) is blocking the input line."""
+    return _SELECTION_FOOTER in _live_tail(pane, 4)
+
+
+def is_prompt_ready(pane: str) -> bool:
+    tail = _live_tail(pane, 6)
+    return _IDLE_FOOTER in tail and _BUSY_FOOTER not in tail and not is_modal_present(pane)
+
+
+# --- Conversation discovery --------------------------------------------------
+
+
+def _normalize(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _prompt_probe(prompt: str) -> str:
+    return _normalize(prompt)[:200]
+
+
+def snapshot_conversations(*, home: Path | None = None) -> frozenset[str]:
+    """Names of the conversation directories that exist right now."""
+    root = _agy_home(home) / "brain"
+    try:
+        return frozenset(entry.name for entry in root.iterdir() if entry.is_dir())
+    except OSError:
+        return frozenset()
+
+
+def _user_inputs(path: Path, offset: int = 0) -> list[str]:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(offset)
+            lines = handle.read().splitlines()
+    except OSError:
+        return []
+    inputs: list[str] = []
+    for line in lines:
+        data = _load_json_object(line)
+        if data is None or data.get("type") != "USER_INPUT":
+            continue
+        content = data.get("content")
+        if isinstance(content, str):
+            inputs.append(_normalize(content))
+    return inputs
+
+
+def transcript_has_user_input(path: Path, offset: int, prompt: str) -> bool:
+    """Delivery ack: a ``USER_INPUT`` carrying *prompt* appeared after *offset*."""
+    probe = _prompt_probe(prompt)
+    return any(probe in text for text in _user_inputs(path, offset))
+
+
+async def locate_conversation(
+    snapshot: frozenset[str],
+    prompt: str,
+    *,
+    home: Path | None = None,
+    timeout_sec: float = 30.0,
+    poll_sec: float = 0.25,
+) -> str | None:
+    """Find the conversation a freshly started TUI created for *prompt*.
+
+    Several agy conversations may start at once (other topics, a manual run),
+    so a new directory only counts when its first user input carries this
+    prompt.
+    """
+    probe = _prompt_probe(prompt)
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        for cid in sorted(snapshot_conversations(home=home) - snapshot):
+            if not is_conversation_id(cid):
+                continue
+            inputs = _user_inputs(transcript_path(cid, home=home))
+            if inputs and probe in inputs[0]:
+                return cid
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(poll_sec)

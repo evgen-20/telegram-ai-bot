@@ -1082,6 +1082,16 @@ class AntigravityAdapter:
 
         return AntigravityExecParser().parse(raw)
 
+    def is_prompt_ready(self, pane: str) -> bool:
+        from telegram_bot.core.services import antigravity
+
+        return antigravity.is_prompt_ready(pane)
+
+    def is_modal_present(self, pane: str) -> bool:
+        from telegram_bot.core.services import antigravity
+
+        return antigravity.is_modal_present(pane)
+
 
 ANTIGRAVITY_ADAPTER = AntigravityAdapter()
 

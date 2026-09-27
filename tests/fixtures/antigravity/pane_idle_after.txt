@@ -1,0 +1,50 @@
+
+      ▄▀▀▄        Antigravity CLI 1.2.12
+     ▀▀▀▀▀▀       user@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.8 Flash (High)
+   ▄▀▀    ▀▀▄     /work/project
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Выполни sleep 6 обычной командой (не в фоне), потом ответь ок
+
+▸ Thought for 2s, 340 tokens
+  The request requires executing a shell command that pauses execution. The core task is running `sleep 6` without backgrounding it, followed by a simple "ок" response. The appropriate tool to ach...
+
+● Bash(sleep 6) (ctrl+o to expand)
+
+  ок
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                                                                                  Gemini 3.8 Flash · high
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
