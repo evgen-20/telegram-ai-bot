@@ -13,6 +13,7 @@ it — ``agy`` is exec'd and authenticates itself.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -23,10 +24,13 @@ from telegram_bot.core.messages import t
 from telegram_bot.core.services.cc_events import StreamEvent, _tool_status
 from telegram_bot.core.services.providers import (
     ExecParseResult,
+    TuiParseResult,
     _is_safe_owned_executable,
     agent_process_env,
 )
 from telegram_bot.core.types import ChannelKey
+
+logger = logging.getLogger(__name__)
 
 AGY_HOME = Path.home() / ".gemini" / "antigravity-cli"
 
@@ -333,3 +337,111 @@ def error_from_stderr(stderr: str) -> str | None:
             parser.parse(line)
     events = parser.finish()
     return events[0].content if events else None
+
+
+# --- Conversation transcript (tmux mode) -------------------------------------
+
+
+def confined_media_path(uri: str, brain_root: Path | None) -> Path | None:
+    """Local path of a transcript ``media.uri``, or ``None`` if it escapes ``brain_root``."""
+    raw = uri.removeprefix("file://")
+    if not raw.startswith("/") or brain_root is None:
+        return None
+    path = Path(os.path.realpath(raw))
+    root = Path(os.path.realpath(brain_root))
+    return path if path.is_relative_to(root) and path != root else None
+
+
+class AntigravityTranscriptParser:
+    """Turn-aware parser for ``brain/<id>/.system_generated/logs/transcript_full.jsonl``.
+
+    One JSON step per line, written while the turn runs. A ``USER_INPUT`` opens
+    a turn and closes any dangling one (an Esc-cancelled turn leaves no closing
+    step). A ``PLANNER_RESPONSE`` without ``tool_calls`` ends the turn.
+
+    When a background task finishes, agy appends a ``SYSTEM_MESSAGE`` and the
+    agent may answer without user input. That answer opens a turn implicitly
+    on its first ``PLANNER_RESPONSE``; the system message itself opens nothing,
+    so a notice the agent ignores cannot leave the topic stuck "processing".
+    """
+
+    def __init__(self, *, brain_root: Path | None) -> None:
+        self._brain_root = brain_root
+        self._turn_id: str | None = None
+
+    @property
+    def current_turn_id(self) -> str | None:
+        return self._turn_id
+
+    @staticmethod
+    def is_turn_boundary(raw: str) -> bool:
+        data = _load_json_object(raw)
+        return data is not None and data.get("type") == "USER_INPUT"
+
+    def _open(self, step_index: int) -> list[StreamEvent]:
+        events = self._close()
+        self._turn_id = f"agy-{step_index}"
+        events.append(StreamEvent("turn_start", "", turn_id=self._turn_id))
+        return events
+
+    def _close(self) -> list[StreamEvent]:
+        turn_id, self._turn_id = self._turn_id, None
+        return [StreamEvent("turn_end", "", turn_id=turn_id)] if turn_id is not None else []
+
+    def parse(self, raw: str) -> TuiParseResult:
+        data = _load_json_object(raw)
+        if data is None:
+            return TuiParseResult([])
+        index = data.get("step_index")
+        if not isinstance(index, int):
+            return TuiParseResult([])
+        kind = data.get("type")
+        if kind == "USER_INPUT":
+            return TuiParseResult(self._open(index))
+        if kind == "PLANNER_RESPONSE":
+            return TuiParseResult(self._planner_response(index, data))
+        if kind == "GENERIC":
+            return TuiParseResult(self._tool_result(data))
+        return TuiParseResult([])
+
+    def _planner_response(self, index: int, data: dict[str, Any]) -> list[StreamEvent]:
+        events = self._open(index) if self._turn_id is None else []
+        turn_id = self._turn_id
+        content = data.get("content")
+        text = content if isinstance(content, str) else ""
+        tool_calls = data.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            if text.strip():
+                events.append(StreamEvent("text", text, turn_id=turn_id))
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                name = call.get("name")
+                args = call.get("args")
+                if isinstance(name, str):
+                    status = tool_status_line(name, args if isinstance(args, dict) else None)
+                    events.append(StreamEvent("status", status, turn_id=turn_id))
+            return events
+        if text.strip():
+            events.append(StreamEvent("result_message", text, turn_id=turn_id))
+        events.extend(self._close())
+        return events
+
+    def _tool_result(self, data: dict[str, Any]) -> list[StreamEvent]:
+        media = data.get("media")
+        if not isinstance(media, list):
+            return []
+        events: list[StreamEvent] = []
+        for item in media:
+            if not isinstance(item, dict):
+                continue
+            mime = item.get("mime_type")
+            uri = item.get("uri")
+            if not (isinstance(mime, str) and mime.startswith("image/") and isinstance(uri, str)):
+                continue
+            path = confined_media_path(uri, self._brain_root)
+            if path is None:
+                logger.warning("Ignoring agy media outside the conversation: %s", uri)
+                continue
+            events.append(StreamEvent("image_message", str(path), turn_id=self._turn_id))
+        return events

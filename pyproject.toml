@@ -51,6 +51,8 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
 "src/telegram_bot/core/handlers/audio.py" = ["RUF001"]
 # Trust-dialog fixtures quote the CLI's own glyphs verbatim.
 "tests/test_public_runtime.py" = ["RUF001"]
+# Antigravity fixtures replay real Russian-language agent transcripts.
+"tests/test_antigravity_*.py" = ["RUF001"]
 
 [tool.mypy]
 python_version = "3.12"
