@@ -240,3 +240,27 @@ async def test_model_change_is_refused_while_busy(tmp_path: Path, monkeypatch) -
 
     callback.answer.assert_awaited_once_with(t("ui.exec_mode_busy"), show_alert=True)
     assert TopicConfig(str(path), str(tmp_path)).get_topic(10).models == {}
+
+
+async def test_model_command_only_claims_antigravity_topics(tmp_path: Path) -> None:
+    """In Claude/Codex tmux topics /model must keep reaching the live TUI."""
+    from telegram_bot.core.handlers import commands
+
+    handler = next(
+        h for h in commands.router.message.handlers if h.callback is commands.handle_model_command
+    )
+    guards = [
+        f.callback for f in handler.filters or [] if f.callback is commands.is_antigravity_topic
+    ]
+    assert guards, "handle_model_command must be guarded by is_antigravity_topic"
+
+    path = tmp_path / "topic_config.json"
+    _topics(path, engine="claude")
+    assert not await commands.is_antigravity_topic(
+        _message(), TopicConfig(str(path), str(tmp_path))
+    )
+    _topics(path, engine="antigravity")
+    assert await commands.is_antigravity_topic(_message(), TopicConfig(str(path), str(tmp_path)))
+    assert not await commands.is_antigravity_topic(
+        _message(thread_id=None), TopicConfig(str(path), str(tmp_path))
+    )

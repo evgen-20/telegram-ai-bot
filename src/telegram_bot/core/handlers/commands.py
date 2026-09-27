@@ -995,7 +995,17 @@ def _model_caption(models: list[tuple[str, str]], current: str | None) -> str:
     return t("ui.model_picker_caption", model=html.escape(name or ""))
 
 
-@router.message(Command("model"))
+async def is_antigravity_topic(message: Message, topic_config: TopicConfig) -> bool:
+    """Filter: claim /model only in Antigravity forum topics.
+
+    Everywhere else /model must keep flowing to the text handler, which
+    forwards it to the live Claude/Codex TUI in tmux topics.
+    """
+    thread_id = message.message_thread_id
+    return thread_id is not None and topic_config.get_topic(thread_id).engine == "antigravity"
+
+
+@router.message(Command("model"), is_antigravity_topic)
 async def handle_model_command(message: Message, topic_config: TopicConfig) -> None:
     """Show the Antigravity model picker for the current forum topic."""
     _, thread_id = channel_key(message)
