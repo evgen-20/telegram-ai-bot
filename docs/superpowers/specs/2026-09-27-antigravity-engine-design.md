@@ -233,9 +233,16 @@ Where the build differs from, or adds to, the design above:
 - **Background-task answers** (a `SYSTEM_MESSAGE` followed by a response with
   no user input) open a turn implicitly on the response; the system message
   itself opens nothing.
-- **MCP double-send** is prevented by that preamble note plus per-stream
-  de-duplication, not by intercepting the MCP call (the MCP server posts to
-  Telegram directly).
+- **MCP double-send** is prevented only by that preamble note: the MCP server
+  posts to Telegram directly, so the bot never sees those sends. Separately,
+  the stream drops an `image_message` whose path was already sent in the
+  same turn (reset on every `turn_start`).
+- **Conversation discovery** matches the whole first message and skips
+  conversations other topics already own, because every first message in a
+  mode starts with the same preamble. A failed discovery resets the pane.
+- **Delivery acknowledgement** in tmux also accepts agy's "queued message"
+  marker (input sent during a running turn is recorded only when that turn
+  ends) and skips agy slash commands, which never write a `USER_INPUT`.
 - **`/model`** (not in the original scope): picks an Antigravity model from
   `agy models`, stored in the topic's per-engine `models` map, and keeps the
   conversation — subprocess picks it up on the next message, a live tmux pane

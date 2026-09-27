@@ -288,6 +288,10 @@ class TmuxManager:
         # conversation. Runtime-only: set when a session starts without a
         # conversation, consumed by that session's first send.
         self._agy_preambles: dict[ChannelKey, str] = {}
+        # Source of that preamble (the SessionManager), kept so it can be
+        # rebuilt for a pane restored after a bot restart before its first
+        # message — the preamble dict itself is runtime-only.
+        self._preamble_source: object | None = None
         # LiveStatusBuffer per channel — owned by TmuxManager because the tail
         # loop outlives a single user message. Typed as object to avoid a
         # circular import on LiveStatusBuffer.
@@ -2532,8 +2536,7 @@ class TmuxManager:
                 agy_snapshot: frozenset[str] | None = None
                 if state.provider == "antigravity" and state.session_id is None:
                     agy_snapshot = antigravity.snapshot_conversations()
-                    preamble = self._agy_preambles.get(channel_key, "")
-                    prompt = preamble + prompt
+                    prompt = self._agy_preamble(channel_key, state) + prompt
 
                 self._cancel_events[channel_key] = cancel_event
                 delivered = await self._safe_send_and_enter(channel_key, state, prompt)
@@ -2543,19 +2546,32 @@ class TmuxManager:
                 self.mark_prompt_pending(channel_key)
 
                 if agy_snapshot is not None:
-                    cid = await antigravity.locate_conversation(agy_snapshot, prompt)
+                    claimed = frozenset(
+                        other.session_id
+                        for key, other in self._sessions.items()
+                        if key != channel_key
+                        and other.provider == "antigravity"
+                        and other.session_id
+                    )
+                    cid = await antigravity.locate_conversation(
+                        agy_snapshot, prompt, exclude=claimed
+                    )
                     if cid is None:
                         logger.warning(
                             "Antigravity conversation discovery failed channel=%s session=%s",
                             channel_key,
                             state.session_name,
                         )
+                        # The pane is now inside a conversation the bot cannot
+                        # name; every later send would fail the same way. Drop
+                        # it so the next message starts a clean one.
+                        await self.close_buffer(channel_key)
+                        await self._kill_session_unlocked(channel_key)
                         ret = on_event(
                             StreamEvent("result_message", t("ui.antigravity_discovery_failed"))
                         )
                         if asyncio.iscoroutine(ret):
                             await ret
-                        await self.close_buffer(channel_key)
                         return ""
                     self._agy_preambles.pop(channel_key, None)
                     state.session_id = cid
@@ -3280,6 +3296,8 @@ class TmuxManager:
         Delegates to `tmux_recovery.restore_all` — see that module for the
         full behavior matrix.
         """
+        if session_manager is not None:
+            self._preamble_source = session_manager
         return _restore_all_impl(self, session_manager)
 
     async def resume_tails(
@@ -3569,6 +3587,18 @@ class TmuxManager:
             state.model = model
             self._save_state()
 
+    def _agy_preamble(self, channel_key: ChannelKey, state: TmuxSessionState) -> str:
+        """First-message preamble for a pane that has no conversation yet."""
+        preamble = self._agy_preambles.get(channel_key)
+        if preamble is not None:
+            return preamble
+        build = getattr(self._preamble_source, "_build_full_prompt", None)
+        if not callable(build):
+            return ""
+        return str(build("", None, state.mode, state.chat_id, channel_key[1])) + (
+            antigravity.PROMPT_NOTE
+        )
+
     def _antigravity_startup_cmd(
         self,
         channel_key: ChannelKey,
@@ -3580,6 +3610,7 @@ class TmuxManager:
         session_manager: object,
     ) -> list[str]:
         """agy TUI command; remembers the first-message preamble for a new conversation."""
+        self._preamble_source = session_manager
         if conversation_id is None:
             build = getattr(session_manager, "_build_full_prompt", None)
             if callable(build):
@@ -3655,17 +3686,24 @@ class TmuxManager:
                 channel_key, state, prompt, pane_before, reason="paste_send_error"
             )
             return False
-        if ack_path is None:
+        # New conversation: the caller's discovery confirms delivery. agy slash
+        # commands (/usage, /quota, …) never write a USER_INPUT step.
+        if ack_path is None or prompt.lstrip().startswith("/"):
             return True
 
         deadline = time.monotonic() + _AGY_DELIVERY_ACK_SEC
+        pane_after = pane_before
         while time.monotonic() < deadline:
             if await asyncio.to_thread(
                 antigravity.transcript_has_user_input, ack_path, ack_offset, prompt
             ):
                 return True
+            pane_after = await capture_pane(session_name)
+            # Sent while a turn runs: agy queues it and records it only when
+            # that turn ends, possibly minutes later.
+            if antigravity.is_input_queued(pane_after):
+                return True
             await asyncio.sleep(0.25)
-        pane_after = await capture_pane(session_name)
         logger.warning(
             "TUI_IO: agy delivery not confirmed session=%s len=%d", session_name, len(prompt)
         )

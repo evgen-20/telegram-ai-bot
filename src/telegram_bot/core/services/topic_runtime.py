@@ -50,7 +50,10 @@ def resolve_topic_runtime_config(
     engine = settings.engine or defaults.engine
     models = settings.models if isinstance(settings.models, dict) else {}
     model = models.get(engine)
-    if model is None:
+    # The legacy single "model" field predates per-engine overrides and holds a
+    # Claude/Codex model name; passing it to agy would start it on a model it
+    # does not know. Antigravity only honours models["antigravity"].
+    if model is None and engine != "antigravity":
         model = settings.model if settings.model is not None else defaults.model
     return TopicRuntimeConfig(
         cwd=cwd,

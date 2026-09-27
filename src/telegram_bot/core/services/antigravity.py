@@ -473,7 +473,8 @@ _IDLE_FOOTER = "? for shortcuts"
 _BUSY_FOOTER = "esc to cancel"
 _TRUST_QUESTION = "Do you trust the contents of this project?"
 _TRUST_ACCEPT = "Yes, I trust this folder"
-_SELECTION_FOOTER = "↑/↓ Navigate"
+_SELECTION_FOOTERS = ("↑/↓ Navigate", "↑/↓ Scroll", "esc Close")
+_QUEUED_FOOTER = "Press up to edit queued"
 
 
 def _live_tail(pane: str, lines: int) -> str:
@@ -488,8 +489,18 @@ def is_trust_dialog(pane: str) -> bool:
 
 
 def is_modal_present(pane: str) -> bool:
-    """A selection list (trust dialog, pickers) is blocking the input line."""
-    return _SELECTION_FOOTER in _live_tail(pane, 4)
+    """A selection list or viewer (trust dialog, pickers, /usage) is covering input."""
+    tail = _live_tail(pane, 4)
+    return any(marker in tail for marker in _SELECTION_FOOTERS)
+
+
+def is_input_queued(pane: str) -> bool:
+    """agy accepted input during a running turn and holds it for the next one.
+
+    Queued input reaches the transcript only when the current turn ends, which
+    may be minutes later, so the queue marker is the delivery acknowledgement.
+    """
+    return _QUEUED_FOOTER in _live_tail(pane, 4)
 
 
 def is_prompt_ready(pane: str) -> bool:
@@ -505,7 +516,9 @@ def _normalize(text: str) -> str:
 
 
 def _prompt_probe(prompt: str) -> str:
-    return _normalize(prompt)[:200]
+    # The whole prompt: a new conversation's first message starts with the
+    # shared mode preamble, so any prefix would match every topic in that mode.
+    return _normalize(prompt)
 
 
 def snapshot_conversations(*, home: Path | None = None) -> frozenset[str]:
@@ -548,17 +561,18 @@ async def locate_conversation(
     home: Path | None = None,
     timeout_sec: float = 30.0,
     poll_sec: float = 0.25,
+    exclude: frozenset[str] = frozenset(),
 ) -> str | None:
     """Find the conversation a freshly started TUI created for *prompt*.
 
     Several agy conversations may start at once (other topics, a manual run),
     so a new directory only counts when its first user input carries this
-    prompt.
+    whole prompt and no other topic has already claimed it (*exclude*).
     """
     probe = _prompt_probe(prompt)
     deadline = time.monotonic() + timeout_sec
     while True:
-        for cid in sorted(snapshot_conversations(home=home) - snapshot):
+        for cid in sorted(snapshot_conversations(home=home) - snapshot - exclude):
             if not is_conversation_id(cid):
                 continue
             inputs = _user_inputs(transcript_path(cid, home=home))

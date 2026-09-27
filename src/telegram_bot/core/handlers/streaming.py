@@ -458,8 +458,9 @@ class _StreamCtx:
     # Last non-tmux `text` event, held back until we know whether it is the
     # turn's final answer. See `_handle_text_event`.
     pending_text: str | None = None
-    # Image paths already sent in this stream — an engine that reports the
-    # same file twice must not post the photo twice.
+    # Image paths already sent in the current turn — an engine that reports
+    # the same file twice must not post the photo twice. Reset on turn_start,
+    # so a later turn may legitimately send an updated file at the same path.
     sent_images: set[str] = field(default_factory=set)
 
 
@@ -941,6 +942,9 @@ async def send_streaming_response(
         if event.type in ("status", "text", "result_message") and not event.content.strip():
             logger.debug("Dropping empty %s event on channel %s", event.type, ctx.channel_key)
             return None
+
+        if event.type == "turn_start":
+            ctx.sent_images.clear()
 
         # image_message events bypass stream-mode routing — they're media,
         # not text, so they're delivered identically in verbose/live/minimal.

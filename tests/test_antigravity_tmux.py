@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from telegram_bot.core.config import Settings
+from telegram_bot.core.messages import t
 from telegram_bot.core.services import antigravity
 from telegram_bot.core.services.cc_events import StreamEvent
 from telegram_bot.core.services.claude import SessionManager
@@ -196,3 +197,43 @@ async def test_state_round_trips_through_restore(managers, tmp_path: Path) -> No
     assert KEY in restored._sessions
     assert restored._sessions[KEY].provider == "antigravity"
     assert restored._sessions[KEY].session_id == cid
+
+
+async def test_first_message_after_a_bot_restart_still_carries_the_preamble(
+    managers, tmp_path: Path
+) -> None:
+    tmux, sm, work = managers
+    await _start(tmux, sm, work)
+
+    restarted = TmuxManager(sessions_dir=tmp_path / "sessions")
+    restarted.restore_all(sm)
+    await _turn(restarted, "after restart")
+
+    state = restarted._sessions[KEY]
+    first_input = json.loads(Path(state.transcript_path or "").read_text().splitlines()[0])
+    assert antigravity.PROMPT_NOTE.strip() in first_input["content"]
+
+
+async def test_failed_discovery_resets_the_pane_so_the_next_message_works(
+    managers, monkeypatch
+) -> None:
+    tmux, sm, work = managers
+    await _start(tmux, sm, work)
+    real_locate = antigravity.locate_conversation
+
+    async def never_found(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(antigravity, "locate_conversation", never_found)
+    events: list[StreamEvent] = []
+    await tmux.send_stream(KEY, "lost one", events.append)
+
+    assert [e.content for e in events if e.type == "result_message"] == [
+        t("ui.antigravity_discovery_failed")
+    ]
+    assert not tmux.is_active(KEY)
+
+    monkeypatch.setattr(antigravity, "locate_conversation", real_locate)
+    await _start(tmux, sm, work)
+    events = await _turn(tmux, "second try")
+    assert [e.content for e in events if e.type == "result_message"] == ["echo: second try"]

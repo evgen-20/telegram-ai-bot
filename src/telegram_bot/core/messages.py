@@ -219,9 +219,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.model_write_failed": "Failed to save the model",
         "ui.model_changed": "Model: {model}. The conversation continues on the new model.",
         "ui.antigravity_discovery_failed": (
-            "Antigravity accepted the message, but the bot could not find its conversation "
-            "to stream the answer. The session is still running; open /tui or send the next "
-            "message when it is done."
+            "Antigravity took the message, but the bot could not find its conversation to "
+            "stream the answer, so it reset the Antigravity session. Send the message again."
         ),
         "ui.compacting": "⏳ Compacting context...",
         "ui.compact_done": "✅ Compacted: {pre:,} → {post:,} tokens",
@@ -528,9 +527,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.model_write_failed": "Не удалось сохранить модель",
         "ui.model_changed": "Модель: {model}. Беседа продолжается на новой модели.",
         "ui.antigravity_discovery_failed": (
-            "Antigravity принял сообщение, но бот не нашёл его беседу, чтобы транслировать "
-            "ответ. Сессия продолжает работать: открой /tui или отправь следующее сообщение, "
-            "когда она закончит."
+            "Antigravity получил сообщение, но бот не нашёл его беседу, чтобы транслировать "
+            "ответ, поэтому сессия Antigravity сброшена. Отправь сообщение ещё раз."
         ),
         "ui.inactivity_kill": "Зависло, попробуй ещё раз",
         "ui.voice_too_large": "Голосовое сообщение слишком большое (максимум 100 МБ).",
