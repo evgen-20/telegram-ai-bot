@@ -1094,9 +1094,12 @@ class SessionManager:
             available_engine = choose_available_engine(requested_engine)
             if available_engine is None:
                 logger.warning(
-                    "No supported agent CLI found for channel %s; install Claude Code or Codex",
+                    "No supported agent CLI found for channel %s (requested %s)",
                     channel_key,
+                    requested_engine,
                 )
+                if requested_engine == "antigravity":
+                    return t("ui.antigravity_not_found")
                 return t("ui.agent_cli_not_found")
             if available_engine != requested_engine:
                 logger.warning(

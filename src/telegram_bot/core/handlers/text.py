@@ -106,7 +106,7 @@ async def handle_text(
 
         if reply_ref is not None:
             settings = topic_config.get_topic(key[1])
-            if reply_ref.provider not in {"claude", "codex"}:
+            if reply_ref.provider not in {"claude", "codex", "antigravity"}:
                 await source_msg.answer(t("ui.tui_session_missing"))
                 return
             target_exec_mode = reply_ref.exec_mode

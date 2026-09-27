@@ -11,7 +11,7 @@ from typing import Literal
 
 from telegram_bot.core.tui.paths import _CODEX_SESSION_ID_RE, _SESSION_ID_RE, cwd_to_slug
 
-EngineName = Literal["claude", "codex"]
+EngineName = Literal["claude", "codex", "antigravity"]
 _SOFT_CAP_BYTES = 64 * 1024
 _PREVIEW_LIMIT = 60
 

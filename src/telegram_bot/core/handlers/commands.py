@@ -10,6 +10,7 @@ import math
 import os
 import time
 from pathlib import Path
+from typing import cast
 
 from aiogram import F, Router
 from aiogram.enums import ChatType
@@ -943,7 +944,7 @@ async def on_engine_click(
     if raw_value not in _VALID_ENGINES:
         await callback.answer(t("ui.engine_invalid"), show_alert=True)
         return
-    new_engine: Engine = "claude" if raw_value == "claude" else "codex"
+    new_engine = cast(Engine, raw_value)
 
     if new_engine == current.engine:
         await callback.answer(t("ui.engine_already"))

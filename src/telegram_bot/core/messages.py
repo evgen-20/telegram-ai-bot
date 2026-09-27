@@ -191,6 +191,11 @@ MESSAGES: dict[str, dict[str, str]] = {
             "same Linux user that runs this bot, make sure it is available on PATH, "
             "then restart the bot."
         ),
+        "ui.antigravity_not_found": (
+            "This topic uses Antigravity, but the agy CLI is not installed for the Linux "
+            "user that runs this bot. Install and sign in to agy, or pick another engine "
+            "with /engine."
+        ),
         "ui.compacting": "⏳ Compacting context...",
         "ui.compact_done": "✅ Compacted: {pre:,} → {post:,} tokens",
         "ui.running_command": "⚙️ Running {command}...",
@@ -464,6 +469,11 @@ MESSAGES: dict[str, dict[str, str]] = {
             "Я не нашёл ни Claude Code, ни Codex. Установи хотя бы один из них "
             "для того же Linux-пользователя, который запускает бота, проверь PATH "
             "и перезапусти бота."
+        ),
+        "ui.antigravity_not_found": (
+            "Этот топик работает на Antigravity, но CLI agy не установлен для "
+            "Linux-пользователя бота. Установи agy и войди в аккаунт или выбери другой "
+            "движок через /engine."
         ),
         "ui.inactivity_kill": "Зависло, попробуй ещё раз",
         "ui.voice_too_large": "Голосовое сообщение слишком большое (максимум 100 МБ).",

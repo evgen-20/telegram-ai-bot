@@ -92,10 +92,19 @@ class SessionBackend(Protocol):
 class BackendDispatcher:
     """Returns the right backend for a given engine name."""
 
-    def __init__(self, *, claude: SessionBackend, codex: SessionBackend) -> None:
+    def __init__(
+        self,
+        *,
+        claude: SessionBackend,
+        codex: SessionBackend,
+        antigravity: SessionBackend | None = None,
+    ) -> None:
+        # Antigravity runs on the same tmux/subprocess backend as Claude unless
+        # a dedicated backend is supplied.
         self._by_engine: dict[Engine, SessionBackend] = {
             "claude": claude,
             "codex": codex,
+            "antigravity": antigravity if antigravity is not None else claude,
         }
 
     def for_engine(self, engine: Engine) -> SessionBackend:

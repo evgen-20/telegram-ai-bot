@@ -382,7 +382,13 @@ async def ensure_exec_mode_ready(
         )
         available_engine = choose_available_engine(requested_engine)
         if available_engine is None:
-            await source_msg.answer(t("ui.agent_cli_not_found"))
+            await source_msg.answer(
+                t(
+                    "ui.antigravity_not_found"
+                    if requested_engine == "antigravity"
+                    else "ui.agent_cli_not_found"
+                )
+            )
             return False
         if available_engine != requested_engine:
             logger.warning(

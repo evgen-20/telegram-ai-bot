@@ -29,7 +29,7 @@ from telegram_bot.core.services.codex_mcp import (
 
 logger = logging.getLogger(__name__)
 
-Engine = Literal["claude", "codex"]
+Engine = Literal["claude", "codex", "antigravity"]
 _CODEX_BOT_HOME = Path.home() / ".codex-bot"
 _CODEX_HOME = Path.home() / ".codex"
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
@@ -140,6 +140,8 @@ def engine_display_name(engine: str) -> str:
         return "Codex"
     if engine == "claude":
         return "Claude Code"
+    if engine == "antigravity":
+        return "Antigravity"
     return engine
 
 
@@ -1074,11 +1076,22 @@ def is_engine_available(engine: str) -> bool:
             return CODEX_ADAPTER._is_safe_binary(Path(CODEX_ADAPTER.binary()))
         except RuntimeError:
             return False
+    if engine == "antigravity":
+        # Lazy import: the antigravity module builds on this one.
+        from telegram_bot.core.services import antigravity
+
+        return antigravity.safe_antigravity_binary() is not None
     return False
 
 
 def choose_available_engine(preferred: str = "claude") -> Engine | None:
-    """Pick an installed engine, preferring the requested one and then the other."""
+    """Pick an installed engine, preferring the requested one and then the other.
+
+    Antigravity is opt-in only: it is never picked as a fallback, and a topic
+    that asked for it gets ``None`` rather than a silent switch to another CLI.
+    """
+    if preferred == "antigravity":
+        return "antigravity" if is_engine_available("antigravity") else None
     if preferred in {"claude", "codex"} and is_engine_available(preferred):
         return preferred  # type: ignore[return-value]
     fallback: Engine = "codex" if preferred == "claude" else "claude"
