@@ -13,6 +13,32 @@ from telegram_bot.core.config import Settings
 logger = logging.getLogger(__name__)
 
 _TRANSCRIPTION_TIMEOUT_SEC = 30
+# Voice messages mix Russian speech with English tech terms, so the single-language
+# model drops the terms it cannot spell in Cyrillic. `multi` enables Nova-3
+# code-switching; the keyterms bias recognition toward names this bot hears daily.
+_VOICE_LANGUAGE = "multi"
+_KEYTERMS = [
+    "Antigravity",
+    "Gemini",
+    "Claude",
+    "Codex",
+    "Anthropic",
+    "Deepgram",
+    "Telegram",
+    "Tailscale",
+    "tmux",
+    "MCP",
+    "CLI",
+    "API",
+    "Vertex",
+    "Traefik",
+    "Docker",
+    "systemd",
+    "GitHub",
+    "OAuth",
+    "VPN",
+    "Jules",
+]
 _MEETING_TRANSCRIPTION_TIMEOUT_SEC = 600
 
 
@@ -40,7 +66,8 @@ class Transcriber:
                 self._client.listen.v1.media.transcribe_file(
                     request=audio_data,
                     model="nova-3",
-                    language="ru",
+                    language=_VOICE_LANGUAGE,
+                    keyterm=_KEYTERMS,
                     smart_format=True,
                 ),
                 timeout=_TRANSCRIPTION_TIMEOUT_SEC,
