@@ -32,6 +32,7 @@ from telegram_bot.core.handlers.voice import router as voice_router
 from telegram_bot.core.keyboards import topic_keyboard
 from telegram_bot.core.messages import t
 from telegram_bot.core.middleware.auth import AuthMiddleware
+from telegram_bot.core.services import antigravity
 from telegram_bot.core.services.bot_commands import setup_bot_commands
 from telegram_bot.core.services.claude import SessionManager
 from telegram_bot.core.services.codex_daemon import CodexDaemonManager
@@ -202,6 +203,13 @@ async def _start() -> None:
         await setup_bot_commands(bot)
     except Exception:
         logger.warning("Failed to set Telegram bot commands", exc_info=True)
+
+    # agy reads MCP servers from one global config, so the bot server is
+    # registered there once; per-topic routing travels in each agy process env.
+    if (agy_binary := antigravity.safe_antigravity_binary()) is not None:
+        await asyncio.to_thread(
+            antigravity.ensure_bot_mcp_registered, settings.app_root_path, binary=agy_binary
+        )
 
     topic_config_path = settings.resolve_workspace_path(settings.topic_config_path)
     workspace_root = settings.workspace_root_path

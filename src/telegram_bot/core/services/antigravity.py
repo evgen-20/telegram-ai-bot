@@ -18,7 +18,9 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -561,3 +563,70 @@ def input_bar_content(pane: str) -> str | None:
         if lines[index - 1].startswith("─") and lines[index + 1].startswith("─"):
             return line[1:].strip()
     return None
+
+
+# --- Bot MCP server ----------------------------------------------------------
+
+_MCP_TIMEOUT_SEC = 30
+
+
+def _has_mcp_server(list_output: str, name: str) -> bool:
+    return any(line.split()[:1] == [name] for line in list_output.splitlines())
+
+
+def ensure_bot_mcp_registered(
+    app_root: Path,
+    *,
+    binary: str | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> bool:
+    """Register this repository's ``bot`` MCP server in agy's global config.
+
+    agy has no per-run MCP flag; the server is registered once and bound to a
+    topic by the routing variables of each agy process. Nothing secret goes
+    into the config — ``start.sh`` reads the bot token from ``.env``. An
+    existing ``bot`` entry is left untouched (the operator may have disabled or
+    customised it). Never raises: a failure only costs the engine its bot tools.
+    """
+    agy = binary or antigravity_binary()
+    env = agent_process_env(binary=agy)
+    try:
+        listed = run(
+            [agy, "mcp", "list"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            timeout=_MCP_TIMEOUT_SEC,
+        )
+        if listed.returncode == 0 and _has_mcp_server(listed.stdout, "bot"):
+            return True
+        added = run(
+            [
+                agy,
+                "mcp",
+                "add",
+                "-e",
+                f"APP_ROOT={app_root}",
+                "-e",
+                f"ENV_FILE={app_root / '.env'}",
+                "-e",
+                f"PROJECT_DIR={app_root}",
+                "bot",
+                "bash",
+                str(app_root / "mcp-servers" / "bot" / "start.sh"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            timeout=_MCP_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.warning("Could not register the bot MCP server with agy", exc_info=True)
+        return False
+    if added.returncode != 0:
+        logger.warning("agy mcp add bot failed: %s", (added.stderr or "").strip()[:300])
+        return False
+    logger.info("Registered the bot MCP server with agy")
+    return True
