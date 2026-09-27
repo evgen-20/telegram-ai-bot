@@ -91,6 +91,8 @@ __all__ = [
 ]
 
 _POLL_SEC = 30.0  # readline poll interval for inactivity check (not user-facing)
+# How long a subprocess run waits for the agy transcript to record a late image.
+_AGY_IMAGE_SETTLE_SEC = 0.5
 _MODEL_OVERRIDE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 
 
@@ -464,15 +466,16 @@ class SessionManager:
         """
         cwd = session.cwd or str(self._default_cwd())
         if session.engine == "antigravity":
+            if session.session_id is None:
+                preamble = self._build_full_prompt(
+                    "", None, session.mode, session.chat_id, session.thread_id
+                )
+                agy_prompt = preamble + antigravity.PROMPT_NOTE + prompt
+            else:
+                agy_prompt = prompt
             return ExecCommand(
                 argv=antigravity.build_exec_argv(
-                    self._build_full_prompt(
-                        prompt,
-                        session.session_id,
-                        session.mode,
-                        session.chat_id,
-                        session.thread_id,
-                    ),
+                    agy_prompt,
                     conversation_id=session.session_id,
                     model=session.model,
                 ),
@@ -1019,6 +1022,7 @@ class SessionManager:
 
         idle_start: float | None = None
         agy_parser = antigravity.AntigravityExecParser() if provider == "antigravity" else None
+        agy_image_steps: list[int] = []
 
         while True:
             try:
@@ -1054,6 +1058,10 @@ class SessionManager:
                         result_text = event.content
                     else:
                         await dispatch(event)
+                agy_image_steps.extend(agy_parser.pending_images())
+                agy_image_steps = await self._deliver_agy_images(
+                    session_id, agy_image_steps, dispatch
+                )
                 idle_start = None
                 continue
 
@@ -1095,12 +1103,36 @@ class SessionManager:
             logger.debug("CC unknown event type: %s", event_type)
 
         if agy_parser is not None:
+            if agy_image_steps:
+                # The transcript may trail the stream by a moment; one late look.
+                await asyncio.sleep(_AGY_IMAGE_SETTLE_SEC)
+                await self._deliver_agy_images(session_id, agy_image_steps, dispatch)
             for event in agy_parser.finish():
                 if event.type == "result":
                     result_text = event.content
                 else:
                     await dispatch(event)
         return result_text, session_id
+
+    @staticmethod
+    async def _deliver_agy_images(
+        conversation_id: str | None,
+        steps: list[int],
+        dispatch: Callable[[StreamEvent], Awaitable[None]],
+    ) -> list[int]:
+        """Send images for finished generate_image steps; return steps not found yet."""
+        if not steps or conversation_id is None:
+            return steps
+        unresolved: list[int] = []
+        for step in steps:
+            found = await asyncio.to_thread(
+                antigravity.find_generated_images, conversation_id, steps=[step]
+            )
+            if not found:
+                unresolved.append(step)
+            for path in found:
+                await dispatch(StreamEvent("image_message", str(path)))
+        return unresolved
 
     async def send_stream(
         self,

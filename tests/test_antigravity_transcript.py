@@ -32,6 +32,11 @@ def _step(index: int, source: str, kind: str, **fields: object) -> str:
     )
 
 
+def _gen_calls(count: int, index: int = 1) -> str:
+    calls = [{"name": "generate_image", "args": {"ImageName": f"i{n}"}} for n in range(count)]
+    return _step(index, "MODEL", "PLANNER_RESPONSE", content="", tool_calls=calls)
+
+
 def test_multi_step_turn_streams_interim_text_statuses_and_one_final_answer() -> None:
     events = _parse(
         AntigravityTranscriptParser(brain_root=BRAIN), _lines("transcript_session.jsonl")[:8]
@@ -125,11 +130,12 @@ def test_image_outside_the_conversation_directory_is_dropped() -> None:
     parser = AntigravityTranscriptParser(brain_root=BRAIN)
     lines = [
         _step(0, "USER_EXPLICIT", "USER_INPUT", content="x"),
+        _gen_calls(2),
         _step(
-            1, "MODEL", "GENERIC", media=[{"mime_type": "image/png", "uri": "file:///etc/passwd"}]
+            2, "MODEL", "GENERIC", media=[{"mime_type": "image/png", "uri": "file:///etc/passwd"}]
         ),
         _step(
-            2,
+            3,
             "MODEL",
             "GENERIC",
             media=[{"mime_type": "image/png", "uri": f"file://{BRAIN}/../../other/x.png"}],
@@ -143,8 +149,9 @@ def test_bare_path_media_uri_is_accepted() -> None:
     parser = AntigravityTranscriptParser(brain_root=BRAIN)
     lines = [
         _step(0, "USER_EXPLICIT", "USER_INPUT", content="x"),
-        _step(1, "MODEL", "GENERIC", media=[{"mime_type": "image/png", "uri": f"{BRAIN}/a.png"}]),
-        _step(2, "MODEL", "GENERIC", media=[{"mime_type": "text/plain", "uri": f"{BRAIN}/a.txt"}]),
+        _gen_calls(2),
+        _step(2, "MODEL", "GENERIC", media=[{"mime_type": "image/png", "uri": f"{BRAIN}/a.png"}]),
+        _step(3, "MODEL", "GENERIC", media=[{"mime_type": "text/plain", "uri": f"{BRAIN}/a.txt"}]),
     ]
 
     images = [e for e in _parse(parser, lines) if e.type == "image_message"]
@@ -177,3 +184,52 @@ def test_turn_boundary_is_a_user_input() -> None:
     assert AntigravityTranscriptParser.is_turn_boundary(lines[0])
     assert not AntigravityTranscriptParser.is_turn_boundary(lines[1])
     assert not AntigravityTranscriptParser.is_turn_boundary("garbage")
+
+
+def test_an_image_the_agent_only_viewed_is_not_sent() -> None:
+    parser = AntigravityTranscriptParser(brain_root=BRAIN)
+    lines = [
+        _step(0, "USER_EXPLICIT", "USER_INPUT", content="look at the screenshot"),
+        _step(
+            1,
+            "MODEL",
+            "PLANNER_RESPONSE",
+            content="",
+            tool_calls=[{"name": "view_file", "args": {"AbsolutePath": "/w/shot.png"}}],
+        ),
+        _step(
+            2,
+            "MODEL",
+            "GENERIC",
+            content="The following is the entire, complete content of the requested file.",
+            media=[{"mime_type": "image/png", "uri": f"{BRAIN}/.tempmediaStorage/media_1.png"}],
+        ),
+    ]
+
+    assert [e for e in _parse(parser, lines) if e.type == "image_message"] == []
+
+
+def test_results_are_matched_to_calls_in_order() -> None:
+    parser = AntigravityTranscriptParser(brain_root=BRAIN)
+    lines = [
+        _step(0, "USER_EXPLICIT", "USER_INPUT", content="x"),
+        _step(
+            1,
+            "MODEL",
+            "PLANNER_RESPONSE",
+            content="",
+            tool_calls=[
+                {"name": "view_file", "args": {"AbsolutePath": "/w/a.png"}},
+                {"name": "generate_image", "args": {"ImageName": "cat"}},
+            ],
+        ),
+        _step(
+            2, "MODEL", "GENERIC", media=[{"mime_type": "image/png", "uri": f"{BRAIN}/.t/v.png"}]
+        ),
+        _step(
+            3, "MODEL", "GENERIC", media=[{"mime_type": "image/jpeg", "uri": f"{BRAIN}/cat_1.jpg"}]
+        ),
+    ]
+
+    images = [e.content for e in _parse(parser, lines) if e.type == "image_message"]
+    assert images == [f"{BRAIN}/cat_1.jpg"]

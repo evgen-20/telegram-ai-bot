@@ -123,6 +123,7 @@ async def test_first_message_binds_the_conversation_and_streams_the_answer(
     # The mode prompt and Telegram context ride along with the first message only.
     assert first_input["content"].count("hello there") == 1
     assert len(first_input["content"]) > len("<USER_REQUEST>\nhello there\n</USER_REQUEST>")
+    assert antigravity.PROMPT_NOTE.strip() in first_input["content"]
 
 
 async def test_follow_up_is_delivered_without_the_preamble(managers) -> None:

@@ -7,7 +7,7 @@ import contextlib
 import html
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -458,6 +458,9 @@ class _StreamCtx:
     # Last non-tmux `text` event, held back until we know whether it is the
     # turn's final answer. See `_handle_text_event`.
     pending_text: str | None = None
+    # Image paths already sent in this stream — an engine that reports the
+    # same file twice must not post the photo twice.
+    sent_images: set[str] = field(default_factory=set)
 
 
 async def _send_status_silent(ctx: _StreamCtx, content: str) -> None:
@@ -942,6 +945,9 @@ async def send_streaming_response(
         # image_message events bypass stream-mode routing — they're media,
         # not text, so they're delivered identically in verbose/live/minimal.
         if event.type == "image_message":
+            if event.content in ctx.sent_images:
+                return None
+            ctx.sent_images.add(event.content)
             if message.bot is not None:
                 try:
                     await dispatch_image_event(

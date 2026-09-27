@@ -20,7 +20,8 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -346,6 +347,9 @@ def error_from_stderr(stderr: str) -> str | None:
 # --- Conversation transcript (tmux mode) -------------------------------------
 
 
+_GENERATED_MARKER = "Generated image is saved at"
+
+
 def confined_media_path(uri: str, brain_root: Path | None) -> Path | None:
     """Local path of a transcript ``media.uri``, or ``None`` if it escapes ``brain_root``."""
     raw = uri.removeprefix("file://")
@@ -372,6 +376,11 @@ class AntigravityTranscriptParser:
     def __init__(self, *, brain_root: Path | None) -> None:
         self._brain_root = brain_root
         self._turn_id: str | None = None
+        # Tool names of the last response's calls, matched in order to the
+        # GENERIC result steps that follow. Only generate_image results are
+        # delivered: view_file on an image also carries media, and echoing a
+        # screenshot the agent merely looked at back into the chat is wrong.
+        self._pending_tools: deque[str] = deque()
 
     @property
     def current_turn_id(self) -> str | None:
@@ -417,12 +426,12 @@ class AntigravityTranscriptParser:
         if isinstance(tool_calls, list) and tool_calls:
             if text.strip():
                 events.append(StreamEvent("text", text, turn_id=turn_id))
+            self._pending_tools.clear()
             for call in tool_calls:
-                if not isinstance(call, dict):
-                    continue
-                name = call.get("name")
-                args = call.get("args")
-                if isinstance(name, str):
+                name = call.get("name") if isinstance(call, dict) else None
+                self._pending_tools.append(name if isinstance(name, str) else "")
+                if isinstance(call, dict) and isinstance(name, str):
+                    args = call.get("args")
                     status = tool_status_line(name, args if isinstance(args, dict) else None)
                     events.append(StreamEvent("status", status, turn_id=turn_id))
             return events
@@ -432,8 +441,15 @@ class AntigravityTranscriptParser:
         return events
 
     def _tool_result(self, data: dict[str, Any]) -> list[StreamEvent]:
+        tool = self._pending_tools.popleft() if self._pending_tools else None
         media = data.get("media")
         if not isinstance(media, list):
+            return []
+        content = data.get("content")
+        generated = tool == "generate_image" or (
+            tool is None and isinstance(content, str) and _GENERATED_MARKER in content
+        )
+        if not generated:
             return []
         events: list[StreamEvent] = []
         for item in media:
@@ -630,3 +646,50 @@ def ensure_bot_mcp_registered(
         return False
     logger.info("Registered the bot MCP server with agy")
     return True
+
+
+# --- Generated images (subprocess mode) --------------------------------------
+
+# Appended to the first-message preamble: the bot sends generate_image output
+# itself, so the agent must not also push it through the bot MCP tools.
+PROMPT_NOTE = (
+    "\n\nImages you create with the generate_image tool are delivered to this Telegram "
+    "chat automatically. Do not send them again with the bot MCP send_image tools.\n\n"
+)
+
+
+def find_generated_images(
+    conversation_id: str,
+    *,
+    steps: Iterable[int],
+    home: Path | None = None,
+) -> list[Path]:
+    """Images produced at *steps* (``generate_image`` step indexes) of a conversation.
+
+    stream-json reports that ``generate_image`` finished but not where the file
+    went; the conversation transcript's result step at the same index carries
+    it. Paths outside the conversation directory are dropped.
+    """
+    if not is_conversation_id(conversation_id):
+        return []
+    wanted = set(steps)
+    root = brain_dir(conversation_id, home=home)
+    try:
+        lines = transcript_path(conversation_id, home=home).read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    images: list[Path] = []
+    for line in lines:
+        data = _load_json_object(line)
+        if data is None or data.get("step_index") not in wanted or data.get("type") != "GENERIC":
+            continue
+        media = data.get("media")
+        for item in media if isinstance(media, list) else []:
+            if not isinstance(item, dict):
+                continue
+            mime, uri = item.get("mime_type"), item.get("uri")
+            if isinstance(mime, str) and mime.startswith("image/") and isinstance(uri, str):
+                path = confined_media_path(uri, root)
+                if path is not None:
+                    images.append(path)
+    return images

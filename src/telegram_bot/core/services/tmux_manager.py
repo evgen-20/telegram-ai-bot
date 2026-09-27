@@ -3576,8 +3576,8 @@ class TmuxManager:
         if conversation_id is None:
             build = getattr(session_manager, "_build_full_prompt", None)
             if callable(build):
-                self._agy_preambles[channel_key] = str(
-                    build("", None, mode, chat_id, channel_key[1])
+                self._agy_preambles[channel_key] = (
+                    str(build("", None, mode, chat_id, channel_key[1])) + antigravity.PROMPT_NOTE
                 )
         else:
             self._agy_preambles.pop(channel_key, None)
