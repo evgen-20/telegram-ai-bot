@@ -693,3 +693,54 @@ def find_generated_images(
                 if path is not None:
                     images.append(path)
     return images
+
+
+# --- Models ------------------------------------------------------------------
+
+_MODEL_CACHE_TTL_SEC = 600.0
+_model_cache: tuple[float, list[tuple[str, str]]] | None = None
+
+
+def clear_model_cache() -> None:
+    global _model_cache
+    _model_cache = None
+
+
+def list_models(
+    *,
+    binary: str | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> list[tuple[str, str]]:
+    """``(id, label)`` pairs from ``agy models``; empty when the CLI fails.
+
+    The list depends on the signed-in account's plan, so it is asked from the
+    CLI rather than hard-coded, and cached briefly because the call goes to the
+    network. Failures are not cached.
+    """
+    global _model_cache
+    now = time.monotonic()
+    if _model_cache is not None and now - _model_cache[0] < _MODEL_CACHE_TTL_SEC:
+        return list(_model_cache[1])
+    agy = binary or antigravity_binary()
+    try:
+        result = run(
+            [agy, "models"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=agent_process_env(binary=agy),
+            timeout=_MCP_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.warning("agy models failed", exc_info=True)
+        return []
+    if result.returncode != 0:
+        return []
+    models: list[tuple[str, str]] = []
+    for line in result.stdout.splitlines():
+        model_id, sep, label = line.partition("\t")
+        if sep and model_id.strip():
+            models.append((model_id.strip(), label.strip() or model_id.strip()))
+    if models:
+        _model_cache = (now, models)
+    return list(models)

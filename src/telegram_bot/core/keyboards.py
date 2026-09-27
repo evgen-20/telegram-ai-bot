@@ -119,6 +119,30 @@ def engine_keyboard(current_engine: str | None = None) -> InlineKeyboardMarkup:
     )
 
 
+def model_keyboard(models: list[tuple[str, str]], current: str | None) -> InlineKeyboardMarkup:
+    """One button per model plus "default"; the active choice gets a check mark."""
+
+    def _label(selected: bool, text: str) -> str:
+        return f"✅ {text}" if selected else text
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=_label(model_id == current, label), callback_data=f"model:{model_id}"
+            )
+        ]
+        for model_id, label in models
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=_label(current is None, t("ui.model_default")), callback_data="model:"
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def resume_keyboard(
     entries: tuple[SessionEntry, ...] | list[SessionEntry],
     *,

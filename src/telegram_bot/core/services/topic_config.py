@@ -516,6 +516,31 @@ class TopicConfig:
             log_label="update_engine_model",
         )
 
+    async def update_model_override(
+        self, thread_id: int, engine: Engine, model: str | None
+    ) -> bool:
+        """Set (or with ``None`` drop) the model override for one engine only.
+
+        Merges into the per-engine ``models`` map, which wins over the legacy
+        single ``model`` field, so other engines keep their own choice.
+        """
+        if engine not in _VALID_ENGINES:
+            return False
+        normalized = _normalize_model(model)
+        if model is not None and normalized is None:
+            logger.warning("update_model_override: invalid model %r", model)
+            return False
+        models: dict[Engine, str] = dict(self.get_topic(thread_id).models)
+        if normalized is None:
+            models.pop(engine, None)
+        else:
+            models[engine] = normalized
+        return await self._update_topic_fields(
+            thread_id=thread_id,
+            values={"models": models},
+            log_label="update_model_override",
+        )
+
     async def update_engine_model_exec_mode(
         self,
         thread_id: int,

@@ -26,11 +26,13 @@ from telegram_bot.core.keyboards import (
     _format_size,
     engine_keyboard,
     exec_mode_keyboard,
+    model_keyboard,
     resume_keyboard,
     stream_mode_keyboard,
     topic_keyboard,
 )
 from telegram_bot.core.messages import reset_lang_cache, t
+from telegram_bot.core.services import antigravity
 from telegram_bot.core.services.claude import SessionManager
 from telegram_bot.core.services.codex_update import CodexUpdateResult, CodexUpdateService
 from telegram_bot.core.services.message_queue import MessageQueue
@@ -981,3 +983,94 @@ async def on_engine_click(
         logger.debug("Failed to refresh engine picker", exc_info=True)
     await callback.answer(t("ui.engine_changed", engine=engine_name))
     await callback.message.answer(t("ui.engine_changed_new_session", engine=engine_name))
+
+
+async def _agy_models() -> list[tuple[str, str]]:
+    return await asyncio.to_thread(antigravity.list_models)
+
+
+def _model_caption(models: list[tuple[str, str]], current: str | None) -> str:
+    labels = dict(models)
+    name = labels.get(current, current) if current else t("ui.model_default")
+    return t("ui.model_picker_caption", model=html.escape(name or ""))
+
+
+@router.message(Command("model"))
+async def handle_model_command(message: Message, topic_config: TopicConfig) -> None:
+    """Show the Antigravity model picker for the current forum topic."""
+    _, thread_id = channel_key(message)
+    if thread_id is None:
+        await message.answer(t("ui.engine_not_in_forum"))
+        return
+    topic = topic_config.get_topic(thread_id)
+    if topic.engine != "antigravity":
+        await message.answer(t("ui.model_only_antigravity"))
+        return
+    models = await _agy_models()
+    if not models:
+        await message.answer(t("ui.model_list_failed"))
+        return
+    current = topic.models.get("antigravity")
+    await message.answer(
+        _model_caption(models, current),
+        reply_markup=model_keyboard(models, current),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("model:"))
+async def on_model_click(
+    callback: CallbackQuery,
+    topic_config: TopicConfig,
+    tmux_manager: TmuxManager,
+    message_queue: MessageQueue,
+    session_manager: SessionManager,
+) -> None:
+    """Switch the Antigravity model and keep the conversation going on it."""
+    if callback.data is None or callback.message is None:
+        await callback.answer()
+        return
+    if isinstance(callback.message, InaccessibleMessage):
+        await callback.answer()
+        return
+    thread_id = callback.message.message_thread_id
+    if thread_id is None:
+        await callback.answer(t("ui.engine_not_in_forum"), show_alert=True)
+        return
+    key = (callback.message.chat.id, thread_id)
+    if topic_config.get_topic(thread_id).engine != "antigravity":
+        await callback.answer(t("ui.model_only_antigravity"), show_alert=True)
+        return
+    if tmux_manager.is_processing(key) or message_queue.is_busy(key):
+        await callback.answer(t("ui.exec_mode_busy"), show_alert=True)
+        return
+
+    _, _, raw_value = callback.data.partition(":")
+    new_model = raw_value or None
+    models = await _agy_models()
+    if new_model is not None and new_model not in dict(models):
+        await callback.answer(t("ui.model_invalid"), show_alert=True)
+        return
+    if not await topic_config.update_model_override(thread_id, "antigravity", new_model):
+        await callback.answer(t("ui.model_write_failed"), show_alert=True)
+        return
+
+    # subprocess sessions pick the model up from topic_config on the next
+    # message; a live tmux pane is restarted on the same conversation.
+    if tmux_manager.is_active(key):
+        tmux_manager.set_model(key, new_model)
+        try:
+            await tmux_manager.recycle(key, session_manager)
+        except RuntimeError:
+            logger.warning("model switch recycle failed for %s", key, exc_info=True)
+            await callback.message.answer(t("ui.recycle_failed"))
+
+    caption = _model_caption(models, new_model)
+    try:
+        await callback.message.edit_text(
+            caption, reply_markup=model_keyboard(models, new_model), parse_mode="HTML"
+        )
+    except Exception:
+        logger.debug("Failed to refresh model picker", exc_info=True)
+    label = dict(models).get(new_model, new_model) if new_model else t("ui.model_default")
+    await callback.answer(t("ui.model_changed", model=label))

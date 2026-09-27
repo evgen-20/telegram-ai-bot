@@ -39,7 +39,12 @@ PUBLIC_BOT_COMMANDS: tuple[LocalizedBotCommand, ...] = (
     LocalizedBotCommand("language", "Сменить язык интерфейса", "Change interface language"),
     LocalizedBotCommand("mode", "Выбрать режим выполнения", "Choose execution mode"),
     LocalizedBotCommand("stream", "Выбрать режим ответов", "Choose response mode"),
-    LocalizedBotCommand("engine", "Выбрать Claude Code или Codex", "Choose Claude Code or Codex"),
+    LocalizedBotCommand(
+        "engine",
+        "Выбрать движок: Claude Code, Codex или Antigravity",
+        "Choose the engine: Claude Code, Codex or Antigravity",
+    ),
+    LocalizedBotCommand("model", "Выбрать модель Antigravity", "Choose the Antigravity model"),
     LocalizedBotCommand("codex_update", "Обновить Codex CLI", "Update Codex CLI"),
     LocalizedBotCommand("resume", "Возобновить сохраненную сессию", "Resume a saved session"),
     LocalizedBotCommand("kill", "Остановить tmux-сессию", "Stop the tmux session"),

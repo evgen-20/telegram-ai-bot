@@ -3562,6 +3562,13 @@ class TmuxManager:
                 exc_info=True,
             )
 
+    def set_model(self, channel_key: ChannelKey, model: str | None) -> None:
+        """Record the model the next respawn (e.g. ``recycle``) should use."""
+        state = self._sessions.get(channel_key)
+        if state is not None:
+            state.model = model
+            self._save_state()
+
     def _antigravity_startup_cmd(
         self,
         channel_key: ChannelKey,

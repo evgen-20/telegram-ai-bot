@@ -206,6 +206,18 @@ MESSAGES: dict[str, dict[str, str]] = {
             "complete the Google sign-in."
         ),
         "ui.antigravity_error": "Antigravity error: {error}",
+        "ui.model_only_antigravity": (
+            "/model picks the model for Antigravity topics. For Claude Code and Codex, set "
+            '"models" for the topic in topic_config.json.'
+        ),
+        "ui.model_picker_caption": "Antigravity model: <b>{model}</b>",
+        "ui.model_default": "Default",
+        "ui.model_list_failed": (
+            "Could not get the model list from agy. Check that it is signed in and try again."
+        ),
+        "ui.model_invalid": "This model is not available for the signed-in account",
+        "ui.model_write_failed": "Failed to save the model",
+        "ui.model_changed": "Model: {model}. The conversation continues on the new model.",
         "ui.antigravity_discovery_failed": (
             "Antigravity accepted the message, but the bot could not find its conversation "
             "to stream the answer. The session is still running; open /tui or send the next "
@@ -502,6 +514,19 @@ MESSAGES: dict[str, dict[str, str]] = {
             "вход через Google."
         ),
         "ui.antigravity_error": "Ошибка Antigravity: {error}",
+        "ui.model_only_antigravity": (
+            "/model выбирает модель для топиков на Antigravity. Для Claude Code и Codex "
+            'задай "models" у топика в topic_config.json.'
+        ),
+        "ui.model_picker_caption": "Модель Antigravity: <b>{model}</b>",
+        "ui.model_default": "По умолчанию",
+        "ui.model_list_failed": (
+            "Не удалось получить список моделей от agy. Проверь, что он авторизован, "
+            "и попробуй ещё раз."
+        ),
+        "ui.model_invalid": "Эта модель недоступна для текущего аккаунта",
+        "ui.model_write_failed": "Не удалось сохранить модель",
+        "ui.model_changed": "Модель: {model}. Беседа продолжается на новой модели.",
         "ui.antigravity_discovery_failed": (
             "Antigravity принял сообщение, но бот не нашёл его беседу, чтобы транслировать "
             "ответ. Сессия продолжает работать: открой /tui или отправь следующее сообщение, "
