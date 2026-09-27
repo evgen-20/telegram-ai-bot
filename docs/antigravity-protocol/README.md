@@ -135,9 +135,25 @@ arguments and truncated long fields; prefer the `_full` variant.
 - `PLANNER_RESPONSE.content` is assistant text (interim or final);
   `tool_calls` lists the calls it made. A `PLANNER_RESPONSE` without
   `tool_calls` ends the turn.
-- `GENERIC` is a tool result. After `generate_image` it carries
-  `media: [{"mime_type":"image/jpeg","uri":"file:///…/brain/<id>/<name>.jpg"}]`;
-  a `view_file` on an image carries the same shape with a bare path.
+- `GENERIC` is a tool result. Results follow the calls of the preceding
+  `PLANNER_RESPONSE` **in order**, one `GENERIC` per call, and carry no tool
+  name themselves — match them to `tool_calls` by position.
+- After `generate_image` a result carries
+  `media: [{"mime_type":"image/jpeg","uri":"file:///…/brain/<id>/<name>.jpg"}]`.
+  A `view_file` on an image carries the same shape with a bare path under
+  `brain/<id>/.tempmediaStorage/` — inside the conversation directory — so a
+  path check alone cannot tell a generated image from one the agent only
+  looked at; the tool name can.
+- Background tasks: a long `run_command` may be moved to the background. Its
+  result is a `GENERIC` with `status: RUNNING`, the turn ends with a
+  `PLANNER_RESPONSE` like "waiting for it to finish", and when the task ends
+  agy appends a `SYSTEM_MESSAGE` followed by a `PLANNER_RESPONSE` **without any
+  user input** — a turn the agent opens on its own. `SYSTEM_MESSAGE` notices
+  also appear right after a `USER_INPUT`, inside a normal turn.
+- Esc (cancel) leaves the `USER_INPUT` without any closing
+  `PLANNER_RESPONSE`; the next `USER_INPUT` is the only boundary.
+- The stream-json `step_index` of a `generate_image` call equals the
+  `step_index` of its `GENERIC` result in the transcript.
 
 ## MCP servers
 
@@ -149,7 +165,12 @@ can be passed as environment variables of the `agy` process itself.
 
 ```bash
 agy mcp add -e KEY=value <name> <command> [args...]   # flags before <name>
+agy mcp list        # table: NAME  TYPE  STATUS  COMMAND/URL
 ```
+
+The model calls MCP tools through the generic `call_mcp_tool` with
+`{"ServerName": "bot", "ToolName": "send_message", "Arguments": {...}}`, after
+reading the tool schema from `~/.gemini/antigravity-cli/mcp/<server>/<tool>.json`.
 
 ## Agent tools
 
@@ -176,9 +197,15 @@ the vendor ships a flag.
   of this project?", options "Yes, I trust this folder" / "No, exit", footer
   `↑/↓ Navigate · enter Confirm`). "Yes" is preselected, so a single Enter
   accepts it. It blocks the pane until answered.
-- Idle footer: `? for shortcuts` under the `>` input line. While a turn runs
-  the footer reads `esc to cancel` (Escape as the cancel key is taken from
-  that hint, not yet exercised).
+- Idle footer: `? for shortcuts` under the `>` input line, which sits between
+  two `─` separators. While a turn runs the footer reads `esc to cancel`;
+  Escape interrupts the turn ("Interrupted · What should Antigravity CLI do
+  instead?") and the idle footer returns.
+- A multi-line bracketed paste collapses into a `[Pasted text #1 +N lines]`
+  chip; one Enter submits the whole text, and the transcript's `USER_INPUT`
+  holds it in full.
+- There is no system-prompt flag. Instructions the agent must follow for the
+  whole conversation have to travel with the first message.
 - The header shows the version, the signed-in account with its plan, the model
   and the workspace path.
 - Onboarding adds a theme picker and a Terms-of-Service screen with a

@@ -1,6 +1,6 @@
 # Antigravity CLI as a third engine — design
 
-**Status:** approved design, awaiting implementation plan
+**Status:** implemented (plan: `docs/superpowers/plans/2026-09-27-antigravity-engine.md`)
 **Date:** 2026-09-27
 **Reference:** [`docs/antigravity-protocol/README.md`](../../antigravity-protocol/README.md)
 
@@ -218,6 +218,29 @@ commits.
 5. **Images** — media extraction, subprocess lookup helper, de-duplication.
 6. **Docs and rollout** — protocol reference, `project-knowledge` and
    `topic-setup` skills, live check, service restart.
+
+## 6a. Implementation notes
+
+Where the build differs from, or adds to, the design above:
+
+- **First-message preamble.** agy has no system-prompt flag, so the mode
+  prompt, the Telegram context and a note that generated images are delivered
+  automatically are prepended to the first message of a new conversation, in
+  both modes.
+- **Images come only from `generate_image` results.** `view_file` on an image
+  also produces media inside the conversation directory, so results are
+  matched to their tool call by position rather than trusted by path.
+- **Background-task answers** (a `SYSTEM_MESSAGE` followed by a response with
+  no user input) open a turn implicitly on the response; the system message
+  itself opens nothing.
+- **MCP double-send** is prevented by that preamble note plus per-stream
+  de-duplication, not by intercepting the MCP call (the MCP server posts to
+  Telegram directly).
+- **`/model`** (not in the original scope): picks an Antigravity model from
+  `agy models`, stored in the topic's per-engine `models` map, and keeps the
+  conversation — subprocess picks it up on the next message, a live tmux pane
+  is recycled onto the same conversation.
+- **Orphan scan** treats `antigravity-tui-v1` panes as bot-owned.
 
 ## 7. Engine credentials — hard rules
 
