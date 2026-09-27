@@ -323,3 +323,13 @@ def _load_json_object(raw: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def error_from_stderr(stderr: str) -> str | None:
+    """Friendly answer for the last ``AGY_ERROR:`` line on stderr, if any."""
+    parser = AntigravityExecParser()
+    for line in stderr.splitlines():
+        if line.startswith("AGY_ERROR:"):
+            parser.parse(line)
+    events = parser.finish()
+    return events[0].content if events else None

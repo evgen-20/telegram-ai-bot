@@ -145,3 +145,98 @@ def test_adapter_parse_exec_event_is_stateless_per_line() -> None:
     line = json.dumps({"event": "init", "conversation_id": CID, "init": {}})
 
     assert ANTIGRAVITY_ADAPTER.parse_exec_event(line).session_id == CID
+
+
+# --- subprocess execution (claude.py branch) --------------------------------
+
+
+def _session_manager(tmp_path: Path):
+    from telegram_bot.core.config import Settings
+    from telegram_bot.core.services.claude import SessionManager
+
+    settings = Settings(_env_file=None, telegram_bot_token="x", project_root=str(tmp_path))
+    return SessionManager(settings)
+
+
+def _agy_session(**overrides: object):
+    from telegram_bot.core.services.claude import SessionData
+
+    session = SessionData(
+        engine="antigravity", cwd="/work/project", chat_id=-100, thread_id=7, mode="free"
+    )
+    for key, value in overrides.items():
+        setattr(session, key, value)
+    return session
+
+
+def test_exec_command_for_a_new_conversation(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "telegram_bot.core.services.antigravity.antigravity_binary", lambda: "/b/agy"
+    )
+    manager = _session_manager(tmp_path)
+
+    cmd = manager._build_exec_command("привет", _agy_session())
+
+    assert cmd.argv[0] == "/b/agy"
+    prompt = cmd.argv[cmd.argv.index("-p") + 1]
+    assert prompt.endswith("привет")
+    assert prompt != "привет"  # mode prompt and Telegram context are prepended
+    assert "--conversation" not in cmd.argv
+    assert cmd.cwd == "/work/project"
+    assert cmd.stdin_text == ""
+    assert cmd.env is not None
+    assert cmd.env["TELEGRAM_CHAT_ID"] == "-100"
+    assert cmd.env["TELEGRAM_THREAD_ID"] == "7"
+
+
+def test_exec_command_resumes_with_the_bare_prompt(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "telegram_bot.core.services.antigravity.antigravity_binary", lambda: "/b/agy"
+    )
+    manager = _session_manager(tmp_path)
+
+    cmd = manager._build_exec_command(
+        "ещё", _agy_session(session_id=CID, model="gemini-3.1-pro-high")
+    )
+
+    assert cmd.argv[cmd.argv.index("-p") + 1] == "ещё"
+    assert cmd.argv[cmd.argv.index("--conversation") + 1] == CID
+    assert cmd.argv[cmd.argv.index("--model") + 1] == "gemini-3.1-pro-high"
+
+
+async def _stream_fixture(tmp_path: Path, name: str) -> tuple[list[StreamEvent], str, str | None]:
+    import asyncio
+
+    manager = _session_manager(tmp_path)
+    process = await asyncio.create_subprocess_exec(
+        "cat",
+        str(FIXTURES / name),
+        stdout=asyncio.subprocess.PIPE,
+    )
+    events: list[StreamEvent] = []
+    result, session_id = await manager._read_stream(process, events.append, provider="antigravity")
+    await process.wait()
+    return events, result, session_id
+
+
+async def test_read_stream_drives_the_antigravity_parser(tmp_path: Path) -> None:
+    events, result, session_id = await _stream_fixture(tmp_path, "exec_tools.ndjson")
+
+    assert result == "hello\n"
+    assert session_id == CID
+    assert [e.type for e in events] == ["status", "status"]
+
+
+async def test_read_stream_reports_errors_as_the_result(tmp_path: Path) -> None:
+    _events, result, _ = await _stream_fixture(tmp_path, "exec_location_error.ndjson")
+
+    assert result == t("ui.antigravity_location_error")
+
+
+def test_stderr_agy_error_is_turned_into_an_answer() -> None:
+    from telegram_bot.core.services.antigravity import error_from_stderr
+
+    stderr = 'noise\nAGY_ERROR: {"short_error":"You are not logged into Antigravity."}\n'
+
+    assert error_from_stderr(stderr) == t("ui.antigravity_auth_error")
+    assert error_from_stderr("plain noise") is None

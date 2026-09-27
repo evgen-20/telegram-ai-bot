@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from telegram_bot.core.config import Settings
 from telegram_bot.core.messages import t
+from telegram_bot.core.services import antigravity
 from telegram_bot.core.services import cc_events as _cc_events
 from telegram_bot.core.services.bot_mcp_runtime import (
     default_bot_mcp_config,
@@ -462,6 +463,24 @@ class SessionManager:
         prompt via stdin and writes the final answer to a unique temp file.
         """
         cwd = session.cwd or str(self._default_cwd())
+        if session.engine == "antigravity":
+            return ExecCommand(
+                argv=antigravity.build_exec_argv(
+                    self._build_full_prompt(
+                        prompt,
+                        session.session_id,
+                        session.mode,
+                        session.chat_id,
+                        session.thread_id,
+                    ),
+                    conversation_id=session.session_id,
+                    model=session.model,
+                ),
+                cwd=cwd,
+                # Empty stdin: agy print mode must not wait on an inherited tty.
+                stdin_text="",
+                env=antigravity.antigravity_process_env((session.chat_id, session.thread_id)),
+            )
         if session.engine != "codex":
             return ExecCommand(
                 argv=self._build_command(
@@ -843,6 +862,8 @@ class SessionManager:
         stderr_text = "".join(stderr_buffer)
         if stderr_text:
             logger.info("CC stderr:\n%s", stderr_text[-2000:])
+        if session.engine == "antigravity" and not result_text:
+            result_text = antigravity.error_from_stderr(stderr_text) or ""
 
         if exec_cmd.output_last_message_path is not None and not force_killed:
             try:
@@ -997,6 +1018,7 @@ class SessionManager:
             raise RuntimeError("stdout pipe not available")
 
         idle_start: float | None = None
+        agy_parser = antigravity.AntigravityExecParser() if provider == "antigravity" else None
 
         while True:
             try:
@@ -1021,6 +1043,18 @@ class SessionManager:
 
             line = raw_line.decode(errors="replace").strip()
             if not line:
+                continue
+
+            if agy_parser is not None:
+                parsed = agy_parser.parse(line)
+                if parsed.session_id:
+                    session_id = parsed.session_id
+                for event in parsed.events:
+                    if event.type == "result":
+                        result_text = event.content
+                    else:
+                        await dispatch(event)
+                idle_start = None
                 continue
 
             if provider == "codex":
@@ -1060,6 +1094,12 @@ class SessionManager:
             # Unknown event types — don't reset idle timer
             logger.debug("CC unknown event type: %s", event_type)
 
+        if agy_parser is not None:
+            for event in agy_parser.finish():
+                if event.type == "result":
+                    result_text = event.content
+                else:
+                    await dispatch(event)
         return result_text, session_id
 
     async def send_stream(
