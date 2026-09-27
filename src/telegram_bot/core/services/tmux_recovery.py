@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from telegram_bot.core.services import antigravity
 from telegram_bot.core.services.bot_mcp_runtime import ensure_bot_runtime_mcp_config
 from telegram_bot.core.services.claude import StreamEvent
 from telegram_bot.core.services.tmux_spawn import (
@@ -45,6 +46,10 @@ def _transcript_path(cwd: str, session_id: str) -> Path:
 def _state_transcript_path(state: TmuxSessionState) -> Path | None:
     if not state.session_id:
         return None
+    if state.provider == "antigravity":
+        if state.transcript_path:
+            return Path(state.transcript_path)
+        return antigravity.transcript_path(state.session_id)
     return _transcript_path(state.cwd, state.session_id)
 
 
@@ -135,9 +140,14 @@ def build_resume_startup_cmd(
     mcp_config: str | None,
     model: str | None,
     session_manager: object,
+    channel_key: ChannelKey | None = None,
 ) -> list[str]:
     """Build provider-specific TUI resume argv."""
-    _ = (cwd, provider)
+    _ = cwd
+    if provider == "antigravity":
+        if channel_key is None:
+            raise ValueError("antigravity resume needs the channel key for MCP routing")
+        return antigravity.build_tui_command(channel_key, conversation_id=session_id, model=model)
     return cast(
         list[str],
         session_manager.build_tmux_startup_args(  # type: ignore[attr-defined]
@@ -220,7 +230,8 @@ def restore_all(
             rv = state.runner_version
 
             is_claude_tui = rv in {"tui-v1", "claude-tui-v1"} and state.provider == "claude"
-            is_supported_tui = is_claude_tui
+            is_agy_tui = rv == "antigravity-tui-v1" and state.provider == "antigravity"
+            is_supported_tui = is_claude_tui or is_agy_tui
 
             if (
                 alive
@@ -290,6 +301,7 @@ def restore_all(
                     mcp_config=state.mcp_config,
                     model=state.model,
                     session_manager=session_manager,
+                    channel_key=channel_key,
                 )
                 if not spawn_tmux_sync(
                     name=state.session_name,

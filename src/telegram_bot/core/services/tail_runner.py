@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from telegram_bot.core.services.antigravity import AntigravityTranscriptParser
 from telegram_bot.core.services.claude import StreamEvent
 from telegram_bot.core.services.providers import CodexTranscriptParser
 from telegram_bot.core.tui.transcript import ClaudeTranscriptParser
@@ -127,11 +128,15 @@ class TailRunner:
         self._read_offset = state.offset
         self._pending_claude_checkpoint: int | None = None
         self._pending_claude_since: float | None = None
-        self._parser = (
-            CodexTranscriptParser()
-            if getattr(state, "provider", "claude") == "codex"
-            else ClaudeTranscriptParser()
-        )
+        provider = getattr(state, "provider", "claude")
+        self._parser: ClaudeTranscriptParser | CodexTranscriptParser | AntigravityTranscriptParser
+        if provider == "codex":
+            self._parser = CodexTranscriptParser()
+        elif provider == "antigravity":
+            # transcript_full.jsonl lives at brain/<id>/.system_generated/logs/.
+            self._parser = AntigravityTranscriptParser(brain_root=output_path.parents[2])
+        else:
+            self._parser = ClaudeTranscriptParser()
 
     async def run(self) -> tuple[str, str | None]:
         """Entry point. Returns (result_text, observed_session_id)."""
@@ -375,7 +380,7 @@ class TailRunner:
                 else:
                     self._event_queue.put_nowait(_Checkpoint(line_end))
                 continue
-            if isinstance(self._parser, CodexTranscriptParser):
+            if isinstance(self._parser, CodexTranscriptParser | AntigravityTranscriptParser):
                 parsed = self._parser.parse(line)
                 events = parsed.events
                 new_sid = parsed.session_id

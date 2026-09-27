@@ -549,3 +549,15 @@ async def locate_conversation(
         if time.monotonic() >= deadline:
             return None
         await asyncio.sleep(poll_sec)
+
+
+def input_bar_content(pane: str) -> str | None:
+    """Text on the ``>`` input line between the two separators, if visible."""
+    lines = [line.rstrip() for line in pane.splitlines() if line.strip()]
+    for index in range(len(lines) - 2, 0, -1):
+        line = lines[index]
+        if not line.startswith(">"):
+            continue
+        if lines[index - 1].startswith("─") and lines[index + 1].startswith("─"):
+            return line[1:].strip()
+    return None

@@ -136,3 +136,9 @@ def test_user_input_ack_only_counts_lines_after_the_offset(tmp_path: Path) -> No
     assert agy.transcript_has_user_input(path, offset, "второй   вопрос")
     assert not agy.transcript_has_user_input(path, offset, "третий")
     assert not agy.transcript_has_user_input(tmp_path / "missing.jsonl", 0, "x")
+
+
+def test_input_bar_content_reads_the_line_between_separators() -> None:
+    assert agy.input_bar_content(_pane("idle")) == ""
+    assert agy.input_bar_content(_pane("idle").replace("\n>\n", "\n> .\n", 1)) == "."
+    assert agy.input_bar_content(_pane("trust")) is None

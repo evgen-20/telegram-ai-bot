@@ -449,6 +449,7 @@ def peek_saved_session(store: StateStore, channel_key: ChannelKey, cwd: str) -> 
     if not (
         (provider == "claude" and rv in {"tui-v1", "claude-tui-v1"})
         or (provider == "codex" and rv == "codex-tui-v1")
+        or (provider == "antigravity" and rv == "antigravity-tui-v1")
     ):
         logger.debug(
             "peek_saved_session: %s runner_version=%s unsupported, skipping",
@@ -467,7 +468,7 @@ def peek_saved_session(store: StateStore, channel_key: ChannelKey, cwd: str) -> 
             cwd,
         )
         return None
-    if provider == "codex":
+    if provider in {"codex", "antigravity"}:
         raw_path = data.get("transcript_path")
         path = Path(raw_path) if isinstance(raw_path, str) else None
     else:
@@ -531,7 +532,7 @@ def scan_orphan_tmux_sessions(state_path: Path) -> list[str]:
         if not name or not name.startswith("cc-"):
             continue
         marker = state_markers.get(name)
-        if marker not in {"tui-v1", "claude-tui-v1", "codex-tui-v1"}:
+        if marker not in {"tui-v1", "claude-tui-v1", "codex-tui-v1", "antigravity-tui-v1"}:
             orphans.append(name)
 
     return sorted(orphans)

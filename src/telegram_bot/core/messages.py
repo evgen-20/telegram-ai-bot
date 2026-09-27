@@ -206,6 +206,11 @@ MESSAGES: dict[str, dict[str, str]] = {
             "complete the Google sign-in."
         ),
         "ui.antigravity_error": "Antigravity error: {error}",
+        "ui.antigravity_discovery_failed": (
+            "Antigravity accepted the message, but the bot could not find its conversation "
+            "to stream the answer. The session is still running; open /tui or send the next "
+            "message when it is done."
+        ),
         "ui.compacting": "⏳ Compacting context...",
         "ui.compact_done": "✅ Compacted: {pre:,} → {post:,} tokens",
         "ui.running_command": "⚙️ Running {command}...",
@@ -497,6 +502,11 @@ MESSAGES: dict[str, dict[str, str]] = {
             "вход через Google."
         ),
         "ui.antigravity_error": "Ошибка Antigravity: {error}",
+        "ui.antigravity_discovery_failed": (
+            "Antigravity принял сообщение, но бот не нашёл его беседу, чтобы транслировать "
+            "ответ. Сессия продолжает работать: открой /tui или отправь следующее сообщение, "
+            "когда она закончит."
+        ),
         "ui.inactivity_kill": "Зависло, попробуй ещё раз",
         "ui.voice_too_large": "Голосовое сообщение слишком большое (максимум 100 МБ).",
         "ui.voice_not_recognized": "Не удалось распознать голосовое сообщение",

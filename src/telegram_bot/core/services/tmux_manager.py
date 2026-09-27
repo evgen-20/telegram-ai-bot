@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from telegram_bot.core.messages import t
+from telegram_bot.core.services import antigravity
 from telegram_bot.core.services.bot_mcp_runtime import ensure_bot_runtime_mcp_config
 from telegram_bot.core.services.claude import Mode, StreamEvent
 from telegram_bot.core.services.process_cleanup import cleanup_tmux_runtime, runtime_diagnostics
@@ -145,6 +146,19 @@ from telegram_bot.core.tui.send_keys import (
     send_text_to_tmux,
 )
 from telegram_bot.core.types import ChannelKey
+
+# How long a send into a known agy conversation waits for its USER_INPUT step.
+_AGY_DELIVERY_ACK_SEC = 15.0
+
+
+def _runner_version(provider: str) -> str:
+    """Persisted runner tag; restore only reattaches versions it understands."""
+    if provider == "codex":
+        return "codex-tui-v1"
+    if provider == "antigravity":
+        return "antigravity-tui-v1"
+    return "claude-tui-v1"
+
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +283,11 @@ class TmuxManager:
         # session as a normal one; the modal watchdog will re-discover any
         # still-open modal on its next tick.
         self._probe_blocked: set[ChannelKey] = set()
+        # Antigravity has no system-prompt flag, so the mode prompt and the
+        # Telegram context ride along with the first message of a fresh
+        # conversation. Runtime-only: set when a session starts without a
+        # conversation, consumed by that session's first send.
+        self._agy_preambles: dict[ChannelKey, str] = {}
         # LiveStatusBuffer per channel — owned by TmuxManager because the tail
         # loop outlives a single user message. Typed as object to avoid a
         # circular import on LiveStatusBuffer.
@@ -599,6 +618,8 @@ class TmuxManager:
         """Apply the provider-specific modal detector to one pane snapshot."""
         if state.provider == "codex":
             return CODEX_ADAPTER.is_modal_present(pane)
+        if state.provider == "antigravity":
+            return antigravity.is_modal_present(pane)
         return is_modal_present(pane)
 
     def observe_tui_pane(
@@ -760,6 +781,22 @@ class TmuxManager:
                     mcp_config=mcp_config,
                 )
                 initial_offset = 0
+        elif provider == "antigravity":
+            session_id = resume_session_id
+            startup_cmd = self._antigravity_startup_cmd(
+                channel_key,
+                conversation_id=resume_session_id,
+                model=model,
+                mode=mode,
+                chat_id=chat_id,
+                session_manager=session_manager,
+            )
+            if resume_session_id is not None:
+                agy_transcript = antigravity.transcript_path(resume_session_id)
+                initial_offset = self._file_size(agy_transcript)
+                transcript_abs = str(agy_transcript)
+            else:
+                initial_offset = 0
         elif resume_session_id is not None:
             session_id = resume_session_id
             startup_cmd = session_manager.build_tmux_startup_args(  # type: ignore[attr-defined]
@@ -791,7 +828,7 @@ class TmuxManager:
             mcp_config=mcp_config,
             chat_id=chat_id,
             offset=initial_offset,
-            runner_version="codex-tui-v1" if provider == "codex" else "claude-tui-v1",
+            runner_version=_runner_version(provider),
             provider=provider,
             model=model,
             transcript_path=transcript_abs,
@@ -977,6 +1014,8 @@ class TmuxManager:
         remaining = max(deadline - time.monotonic(), 0.0)
         if provider == "codex":
             ready = await self._await_codex_prompt_ready(name, timeout=remaining)
+        elif provider == "antigravity":
+            ready = await self._await_antigravity_prompt_ready(name, timeout=remaining)
         else:
             ready = await await_prompt_ready(name, timeout=remaining, clock=time.monotonic)
         if not ready:
@@ -994,7 +1033,11 @@ class TmuxManager:
         # needs ~5-8s after the glyph appears to finish loading MCP
         # servers; sending a paste during that window is silently lost.
         # Probe with one dot and wait for it to land in the input bar.
-        get_bar_fn = codex_input_bar_content if provider == "codex" else claude_input_bar_content
+        get_bar_fn: Callable[[str], str | None] = claude_input_bar_content
+        if provider == "codex":
+            get_bar_fn = codex_input_bar_content
+        elif provider == "antigravity":
+            get_bar_fn = antigravity.input_bar_content
         ready_input = await self._probe_input_ready(name, get_input_bar_fn=get_bar_fn)
         if not ready_input:
             # Don't kill tmux. A failed probe is the strongest universal
@@ -1359,6 +1402,8 @@ class TmuxManager:
         session_name = state.session_name
         if state.provider == "codex":
             return await self._safe_send_codex(channel_key, state, prompt)
+        if state.provider == "antigravity":
+            return await self._safe_send_antigravity(channel_key, state, prompt)
 
         # Claude path: simplified modal-guard pipeline. The legacy paste-
         # retry / Enter-retry loop below is unreachable dead code, kept on
@@ -2484,12 +2529,39 @@ class TmuxManager:
                 if needs_codex_discovery:
                     codex_snapshot = CODEX_ADAPTER.capture_tui_transcript_snapshot()
 
+                agy_snapshot: frozenset[str] | None = None
+                if state.provider == "antigravity" and state.session_id is None:
+                    agy_snapshot = antigravity.snapshot_conversations()
+                    preamble = self._agy_preambles.get(channel_key, "")
+                    prompt = preamble + prompt
+
                 self._cancel_events[channel_key] = cancel_event
                 delivered = await self._safe_send_and_enter(channel_key, state, prompt)
                 if not delivered:
                     # _safe_send_and_enter posted an alert; do not start tail.
                     return ""
                 self.mark_prompt_pending(channel_key)
+
+                if agy_snapshot is not None:
+                    cid = await antigravity.locate_conversation(agy_snapshot, prompt)
+                    if cid is None:
+                        logger.warning(
+                            "Antigravity conversation discovery failed channel=%s session=%s",
+                            channel_key,
+                            state.session_name,
+                        )
+                        ret = on_event(
+                            StreamEvent("result_message", t("ui.antigravity_discovery_failed"))
+                        )
+                        if asyncio.iscoroutine(ret):
+                            await ret
+                        await self.close_buffer(channel_key)
+                        return ""
+                    self._agy_preambles.pop(channel_key, None)
+                    state.session_id = cid
+                    state.transcript_path = str(antigravity.transcript_path(cid))
+                    state.offset = 0
+                    self._save_state()
 
                 if needs_codex_discovery and codex_snapshot is not None:
                     try:
@@ -2665,6 +2737,18 @@ class TmuxManager:
             )
             candidate.session_id = None
             candidate.transcript_path = None
+        elif candidate.provider == "antigravity":
+            new_session_id = None
+            startup_cmd = self._antigravity_startup_cmd(
+                channel_key,
+                conversation_id=None,
+                model=candidate.model,
+                mode=candidate.mode,
+                chat_id=candidate.chat_id,
+                session_manager=session_manager,
+            )
+            candidate.session_id = None
+            candidate.transcript_path = None
         else:
             candidate.base_mcp_config = self._effective_base_mcp_config(
                 channel_key=channel_key,
@@ -2750,6 +2834,11 @@ class TmuxManager:
         # legacy or malformed ids.
         if state.provider == "codex":
             target_transcript = self._find_codex_transcript(new_session_id, state.cwd)
+        elif state.provider == "antigravity":
+            if not antigravity.is_conversation_id(new_session_id):
+                logger.info("switch_session: malformed agy conversation id %r", new_session_id)
+                return False
+            target_transcript = antigravity.transcript_path(new_session_id)
         else:
             from telegram_bot.core.tui.paths import _SESSION_ID_RE
 
@@ -2794,6 +2883,15 @@ class TmuxManager:
                 session_id=new_session_id,
                 model=candidate.model,
                 mcp_config=candidate.mcp_config,
+            )
+        elif candidate.provider == "antigravity":
+            startup_cmd = self._antigravity_startup_cmd(
+                channel_key,
+                conversation_id=new_session_id,
+                model=candidate.model,
+                mode=candidate.mode,
+                chat_id=candidate.chat_id,
+                session_manager=session_manager,
             )
         else:
             startup_cmd = session_manager.build_tmux_startup_args(  # type: ignore[attr-defined]
@@ -2936,6 +3034,7 @@ class TmuxManager:
                 mcp_config=runtime_for_resume.mcp_config,
                 model=runtime.model,
                 session_manager=session_manager,
+                channel_key=channel_key,
             )
             try:
                 await self._spawn_tmux(
@@ -3040,6 +3139,15 @@ class TmuxManager:
                         model=candidate.model,
                         mcp_config=candidate.mcp_config,
                     )
+            elif candidate.provider == "antigravity":
+                startup_cmd = self._antigravity_startup_cmd(
+                    channel_key,
+                    conversation_id=resume_id,
+                    model=candidate.model,
+                    mode=candidate.mode,
+                    chat_id=candidate.chat_id,
+                    session_manager=session_manager,
+                )
             elif resume_id:
                 startup_cmd = session_manager.build_tmux_startup_args(  # type: ignore[attr-defined]
                     mode=candidate.mode,
@@ -3367,6 +3475,8 @@ class TmuxManager:
 
     @staticmethod
     def _validate_session_id_shape(session_id: str, provider: str) -> bool:
+        if provider == "antigravity":
+            return antigravity.is_conversation_id(session_id)
         if provider == "codex":
             from telegram_bot.core.tui.paths import _CODEX_SESSION_ID_RE
 
@@ -3394,10 +3504,12 @@ class TmuxManager:
             mcp_config=runtime.mcp_config or "",
             chat_id=channel_key[0],
             offset=0,
-            runner_version="codex-tui-v1" if provider == "codex" else "claude-tui-v1",
+            runner_version=_runner_version(provider),
             provider=provider,
             model=runtime.model,
-            transcript_path=str(transcript_path) if provider == "codex" else None,
+            transcript_path=(
+                str(transcript_path) if provider in {"codex", "antigravity"} else None
+            ),
             base_mcp_config=runtime.mcp_config,
         )
 
@@ -3450,6 +3562,111 @@ class TmuxManager:
                 exc_info=True,
             )
 
+    def _antigravity_startup_cmd(
+        self,
+        channel_key: ChannelKey,
+        *,
+        conversation_id: str | None,
+        model: str | None,
+        mode: Mode,
+        chat_id: int,
+        session_manager: object,
+    ) -> list[str]:
+        """agy TUI command; remembers the first-message preamble for a new conversation."""
+        if conversation_id is None:
+            build = getattr(session_manager, "_build_full_prompt", None)
+            if callable(build):
+                self._agy_preambles[channel_key] = str(
+                    build("", None, mode, chat_id, channel_key[1])
+                )
+        else:
+            self._agy_preambles.pop(channel_key, None)
+        return antigravity.build_tui_command(
+            channel_key, conversation_id=conversation_id, model=model
+        )
+
+    async def _await_antigravity_prompt_ready(self, session_name: str, timeout: float) -> bool:
+        """agy readiness: accept the trust dialog once, then wait for the idle footer."""
+        deadline = time.monotonic() + timeout
+        trust_handled = False
+        while time.monotonic() < deadline:
+            try:
+                pane = await capture_pane(session_name)
+            except (OSError, subprocess.SubprocessError):
+                return False
+            if not trust_handled and antigravity.is_trust_dialog(pane):
+                # "Yes, I trust this folder" is preselected; the operator chose
+                # this cwd in topic_config, so accepting it is the intent.
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["tmux", "send-keys", "-t", f"={session_name}:", "Enter"],
+                    capture_output=True,
+                    check=False,
+                )
+                trust_handled = True
+                await asyncio.sleep(0.5)
+                continue
+            if antigravity.is_prompt_ready(pane):
+                return True
+            await asyncio.sleep(0.5)
+        return False
+
+    async def _safe_send_antigravity(
+        self,
+        channel_key: ChannelKey,
+        state: TmuxSessionState,
+        prompt: str,
+    ) -> bool:
+        """Paste + Enter into agy, refusing when a selection list is open.
+
+        agy collapses a long paste into a ``[Pasted text]`` chip and submits it
+        whole on Enter. For a known conversation delivery is confirmed by the
+        ``USER_INPUT`` appearing in the transcript; for a new one the caller's
+        conversation discovery is the confirmation.
+        """
+        session_name = state.session_name
+        pane_before = await capture_pane(session_name)
+        if antigravity.is_modal_present(pane_before):
+            logger.info(
+                "TUI_IO: send BLOCKED session=%s len=%d reason=modal_before_send",
+                session_name,
+                len(prompt),
+            )
+            await self._send_modal_alert(
+                channel_key, state, prompt, pane_before, reason="modal_before_send"
+            )
+            return False
+        self._modal_alerted_channels.discard(channel_key)
+
+        ack_path = self._transcript_path_for_state(state)
+        ack_offset = self._file_size(ack_path) if ack_path is not None else 0
+        try:
+            await send_text_to_tmux(session_name, prompt, submit_enter=True)
+        except (OSError, subprocess.SubprocessError):
+            logger.warning("TUI_IO: agy send failed session=%s", session_name)
+            await self._send_modal_alert(
+                channel_key, state, prompt, pane_before, reason="paste_send_error"
+            )
+            return False
+        if ack_path is None:
+            return True
+
+        deadline = time.monotonic() + _AGY_DELIVERY_ACK_SEC
+        while time.monotonic() < deadline:
+            if await asyncio.to_thread(
+                antigravity.transcript_has_user_input, ack_path, ack_offset, prompt
+            ):
+                return True
+            await asyncio.sleep(0.25)
+        pane_after = await capture_pane(session_name)
+        logger.warning(
+            "TUI_IO: agy delivery not confirmed session=%s len=%d", session_name, len(prompt)
+        )
+        await self._send_modal_alert(
+            channel_key, state, prompt, pane_after, reason="delivery_unconfirmed"
+        )
+        return False
+
     async def _locate_codex_transcript_after_send(
         self,
         state: TmuxSessionState,
@@ -3472,6 +3689,10 @@ class TmuxManager:
         self._save_state()
 
     def _transcript_path_for_state(self, state: TmuxSessionState) -> Path | None:
+        if state.provider == "antigravity":
+            if state.transcript_path:
+                return Path(state.transcript_path)
+            return antigravity.transcript_path(state.session_id) if state.session_id else None
         if state.provider == "codex":
             if state.transcript_path:
                 return Path(state.transcript_path)
