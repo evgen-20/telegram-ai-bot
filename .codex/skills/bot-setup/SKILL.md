@@ -19,6 +19,8 @@ Before changing files, ask the user:
 
 - Which bot UI language: English (`en`) or Russian (`ru`)?
 - Which engine should be the default for project topics: Claude Code or Codex?
+  Should any topic use Antigravity CLI (`agy`)? Antigravity is opt-in per
+  topic only.
 - Should the bot run as a foreground dev process or as a systemd service with
   autostart and restart-on-failure?
 - Private chat only, or a Telegram supergroup with forum topics?
@@ -39,6 +41,10 @@ Verify these before running the bot:
   with either one installed. It prefers Claude Code by default, but if the
   configured topic engine is missing and the other engine is installed, it
   switches the topic to the available engine.
+- Optional: Antigravity CLI (`agy`) as a third engine. It is opt-in only: it is
+  never an automatic fallback for Claude/Codex, and a topic whose engine is
+  `antigravity` answers "Antigravity CLI not found" instead of switching
+  engines when `agy` is missing.
 - `tmux` if the user wants persistent TUI sessions.
 - Optional: Deepgram API key for voice transcription.
 
@@ -49,6 +55,7 @@ python3 --version
 uv --version
 command -v claude || true
 command -v codex || true
+command -v agy || ls -l ~/.local/bin/agy || true
 command -v tmux || true
 ```
 
@@ -74,6 +81,9 @@ Edit `.env`. Required values:
 - `TMUX_SESSIONS_DIR`: usually `./tmux_sessions`.
 - `CC_MAX_TURNS`: default turn limit for Claude Code.
 - `CC_INACTIVITY_KILL_SEC`: inactivity timeout before killing a stuck process.
+- `TELEGRAM_AGY_BIN` (optional): absolute path to `agy`. It must be owned by the
+  service user and not group/world-writable. Without it the bot uses
+  `~/.local/bin/agy`, then `PATH`.
 
 Set `BOT_LANG=ru` for Russian UI. The language is read at process startup, so
 restart the bot after changing it.
@@ -81,6 +91,43 @@ restart the bot after changing it.
 For voice transcription, create a Deepgram account, generate an API key, set it
 as `DEEPGRAM_API_KEY` in `.env`, and restart the bot. Leave it empty to disable
 voice messages.
+
+## Antigravity CLI (Optional)
+
+Install as the Linux user that runs the bot:
+
+```bash
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+```
+
+This places a single Go binary (no Node) at `~/.local/bin/agy`. Sign-in is
+interactive and must be done by the operator once: run `agy` in a terminal or
+tmux, choose Google OAuth, open the printed URL, paste the code back, and
+finish any browser account-verification step. Then verify headless mode:
+
+```bash
+agy -p "Reply with exactly: ok" --output-format json --dangerously-skip-permissions
+```
+
+Credential hard rules:
+
+- `agy` stores its OAuth token in
+  `~/.gemini/antigravity-cli/antigravity-oauth-token`. The bot never reads it.
+  Never commit, print, or copy it to another machine.
+- One Google account per host. Signing the same account in on a second host or
+  network has made an already-working host fail with "User location is not
+  supported" for a while.
+
+At start-up, when `agy` is installed, the bot registers its own MCP server
+named `bot` in `agy`'s global MCP config (`agy mcp add ... bot bash
+<repo>/mcp-servers/bot/start.sh`). An existing `bot` entry is left untouched.
+Topic routing comes from each `agy` process environment
+(`TELEGRAM_CHAT_ID`/`TELEGRAM_THREAD_ID`); no secrets are written into `agy`'s
+config. Images from `agy`'s built-in `generate_image` tool are sent to the chat
+automatically.
+
+`agy` has no headless usage command. Check quota with `/usage` inside the `agy`
+TUI (for example via `/tui`); the bot does not show it.
 
 ## Foreground Run
 
@@ -110,7 +157,8 @@ When a new forum topic appears, the running bot auto-registers it in
 `mcp_config=null`, and no explicit engine. Runtime prefers `claude`; if Claude
 Code is missing but Codex is installed, it starts with Codex and persists
 `engine=codex` for that topic. If neither CLI exists, the bot still starts and
-tells the user to install Claude Code or Codex.
+tells the user to install Claude Code or Codex. New topics never default to
+Antigravity; set `engine=antigravity` explicitly or use `/engine`.
 
 ## Systemd Autostart
 
@@ -226,8 +274,10 @@ Both public prompt modes have the same generic bot MCP send-tool whitelist:
 - `exec_mode`: `subprocess` for one-off assistant tasks where the user does
   not need a persistent agent process, or `tmux` for full development sessions
   with persistent context, TUI snapshots, `/resume`, and `/tui`.
-- `engine`: `claude` or `codex`.
-- `models`: optional per-engine overrides keyed by `claude` and/or `codex`.
+- `engine`: `claude`, `codex`, or `antigravity`. Antigravity works with both
+  `tmux` and `subprocess`.
+- `models`: optional per-engine overrides keyed by `claude`, `codex`, and/or
+  `antigravity` (for example `{"antigravity": "gemini-3.1-pro-high"}`).
   The active engine's entry wins over the legacy `model` fallback, and
   manual `/engine` changes preserve the map. During automatic missing-CLI
   fallback, the first fallback request uses the provider default; the saved
@@ -250,8 +300,14 @@ overrides.
   one-off assistant tasks where a persistent agent process is unnecessary;
   `tmux` is best for full development work, persistent context, TUI snapshots,
   `/resume`, and `/tui`.
-- `/engine`: choose Claude Code or Codex for the current forum topic. It resets
-  the active session when switching.
+- `/engine`: choose Claude Code, Codex, or Antigravity for the current forum
+  topic. It resets the active session when switching.
+- `/model`: Antigravity topics only; pick a model from `agy models` (the list
+  depends on the signed-in plan, e.g. Gemini Flash/Pro, Claude Sonnet/Opus,
+  GPT-OSS) or "Default". The choice is saved in the topic's `models` map and
+  the conversation continues on the new model: subprocess uses it from the
+  next message, a live tmux pane is recycled onto the same conversation. In
+  Claude/Codex topics it explains how to set `models` in `topic_config.json`.
 - `/codex_update`: update the Codex CLI manually; it bypasses the automatic
   cooldown but refuses to run during another bot-managed update in this process
   or a bot-managed active Codex session. `/codex_update status` shows the last
@@ -260,6 +316,8 @@ overrides.
   `live` edits one progress buffer, and `minimal` suppresses tool/status noise.
   Human-readable intermediate updates remain separate in every mode.
 - `/resume`: in tmux mode, pick a saved Claude/Codex session for the topic cwd.
+- In Antigravity tmux topics, `/cancel` sends Esc, `/clear` starts a fresh `agy`
+  conversation, and `/recycle` restarts on the same conversation.
 - `/tui`: show a current tmux TUI snapshot with controls.
 - `/tail`: alias for `/tui`.
 - `/kill`: stop the active tmux session and free resources.
@@ -304,10 +362,20 @@ Runtime checks:
   that runs systemd, use a PATH where systemd can find it, then restart the
   bot. If both are installed, topics prefer Claude Code unless configured
   otherwise.
+- "Antigravity CLI not found": install `agy` for the service user, or set
+  `TELEGRAM_AGY_BIN` to an absolute path owned by that user and not
+  group/world-writable, then restart. The bot does not fall back to another
+  engine for Antigravity topics.
+- Antigravity says it is not signed in: run `agy` interactively as the service
+  user and complete the Google OAuth sign-in.
+- Antigravity reports "User location is not supported": this is an account or
+  region issue on Google's side, not a bot bug. Check that the same Google
+  account is not signed in on another host or network; give each host its own
+  account and wait for the block to clear.
 - Voice messages do not transcribe: create a Deepgram API key, set
   `DEEPGRAM_API_KEY` in `.env`, and restart.
-- `/mode`, `/engine`, `/stream`, `/resume` do nothing in private chat: these are
-  forum-topic settings.
+- `/mode`, `/engine`, `/stream`, `/resume` do nothing in private chat:
+  these are forum-topic settings.
 - `/resume` unavailable: switch the topic to tmux mode and start a session.
 - Tmux does not start: install `tmux`, check resource limits, and inspect
   service logs.

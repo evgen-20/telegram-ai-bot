@@ -2,11 +2,11 @@
 
 [Русская версия](README.ru.md)
 
-Telegram AI Agent is an open-source Telegram bot for controlling Claude Code and
-Codex CLI on your VPS. It turns Telegram into a remote interface for agentic
-coding: open a topic for a project, send tasks from your phone, attach files or
-voice notes, watch progress, resume old sessions, and drive the live terminal
-UI when the agent needs input.
+Telegram AI Agent is an open-source Telegram bot for controlling Claude Code,
+Codex CLI, and Antigravity CLI on your VPS. It turns Telegram into a remote
+interface for agentic coding: open a topic for a project, send tasks from your
+phone, attach files or voice notes, watch progress, resume old sessions, and
+drive the live terminal UI when the agent needs input.
 
 The repository contains the reusable public bot runtime only. It does not
 contain private assistant data, private prompts, runtime state, real IDs,
@@ -14,11 +14,13 @@ tokens, or machine-specific deployment config.
 
 ## What You Can Do
 
-- Run Claude Code or Codex from Telegram private chats or group forum topics.
+- Run Claude Code, Codex, or Antigravity from Telegram private chats or group
+  forum topics.
 - Keep one Telegram topic per project, workflow, or long-running agent context.
 - Bind a topic to a directory on your VPS, for example
   `/home/user/projects/my-app`.
-- Choose Claude Code or Codex per topic.
+- Choose Claude Code, Codex, or Antigravity per topic, and pick the
+  Antigravity model with `/model`.
 - Use a persistent `tmux` session for real development work, or a short-lived
   subprocess for simple one-off tasks.
 - Send text, photos, documents, forwarded message batches, Telegram rich
@@ -36,13 +38,14 @@ tokens, or machine-specific deployment config.
 
 ## How It Works
 
-The bot runs on the same machine as Claude Code and/or Codex CLI. Telegram is
-only the control surface. When you send a message, the bot:
+The bot runs on the same machine as Claude Code, Codex CLI, and/or Antigravity
+CLI. Telegram is only the control surface. When you send a message, the bot:
 
 1. checks that your Telegram user ID is allowed;
 2. downloads attached media when needed;
 3. resolves the current chat or forum topic settings;
-4. sends the prompt to Claude Code or Codex in the configured working directory;
+4. sends the prompt to Claude Code, Codex, or Antigravity in the configured
+   working directory;
 5. streams progress and the final answer back to Telegram.
 
 ## Rich Final Answers
@@ -68,7 +71,7 @@ have its own:
 
 - `cwd`: project directory on the VPS;
 - `mode`: prompt mode;
-- `engine`: `claude` or `codex`;
+- `engine`: `claude`, `codex`, or `antigravity`;
 - `exec_mode`: `tmux` or `subprocess`;
 - `stream_mode`: `verbose`, `live`, or `minimal`;
 - `mcp_config`: optional MCP config for the agent;
@@ -83,13 +86,14 @@ You need a Linux machine or VPS where the bot and agent CLIs will run.
 - Telegram bot token from `@BotFather`
 - Your numeric Telegram user ID from `@userinfobot`
 - Claude Code CLI and/or Codex CLI installed for the same Linux user that runs
-  the bot
+  the bot; Antigravity CLI (`agy`) is an optional third engine
 - `tmux` for persistent development sessions
 - Optional: Deepgram API key for voice transcription
 
 The bot can run with only one agent CLI installed. It prefers Claude Code by
 default, but if Claude Code is missing and Codex is available, a topic can run
-with Codex.
+with Codex. Antigravity is opt-in only: it is never chosen as an automatic
+fallback, and a topic runs it only when its `engine` is set to `antigravity`.
 
 Check the server user before continuing:
 
@@ -99,10 +103,43 @@ uv --version
 command -v tmux
 command -v claude || true
 command -v codex || true
+command -v agy || ls -l ~/.local/bin/agy || true
 ```
 
 At least one of `claude` or `codex` must exist. Also make sure the CLI is
 authenticated or configured for the same Linux user that will run the bot.
+
+### Optional: Antigravity CLI
+
+Antigravity CLI (`agy`) is Google's terminal coding agent. It is a single Go
+binary with no Node dependency. Install it as the bot's Linux user:
+
+```bash
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+```
+
+The installer puts the binary at `~/.local/bin/agy`. Sign in once inside the
+TUI: run `agy` in a terminal or tmux, choose Google OAuth, open the printed URL,
+and paste the code back. A browser account-verification step may follow. Then
+check headless mode:
+
+```bash
+agy -p "Reply with exactly: ok" --output-format json --dangerously-skip-permissions
+```
+
+The bot looks for `TELEGRAM_AGY_BIN` (an absolute path, owned by the service
+user and not group/world-writable), then `~/.local/bin/agy`, then `PATH`.
+
+Credential rules:
+
+- `agy` keeps its OAuth token in
+  `~/.gemini/antigravity-cli/antigravity-oauth-token`. The bot never reads it.
+  Never commit, print, or copy it to another machine.
+- Give each host its own Google account. Signing the same account in on a
+  second host or network has made an already-working host fail with
+  "User location is not supported" for a while.
+- `agy` has no headless usage command; check quota with `/usage` inside the
+  `agy` TUI (for example through `/tui`). The bot does not show it.
 
 ## Setup Option A: Agent-Assisted
 
@@ -185,6 +222,8 @@ Notes:
   projects, topic config, session mappings, tmux state, and downloaded files.
 - `DEFAULT_CWD`: default working directory for unconfigured topics.
 - `DEEPGRAM_API_KEY`: leave empty if you do not need voice messages.
+- `TELEGRAM_AGY_BIN`: optional absolute path to the Antigravity CLI binary.
+  Leave it unset to use `~/.local/bin/agy` or `PATH`.
 - `CODEX_AUTO_UPDATE_ENABLED`: enables automatic and manual Codex updates.
   Timeout bounds every update; cooldown applies only to automatic updates.
 
@@ -195,8 +234,9 @@ uv run telegram-bot
 ```
 
 Open Telegram and send `/start`. Before installing systemd, send one normal
-message and check that Claude Code or Codex answers. This catches missing CLI
-auth, wrong `PATH`, and bad project paths while logs are still in your terminal.
+message and check that Claude Code, Codex, or Antigravity answers. This catches
+missing CLI auth, wrong `PATH`, and bad project paths while logs are still in
+your terminal.
 
 ## Telegram Bot And Group Setup
 
@@ -231,9 +271,9 @@ open the generated `topic_config.json` and edit the new entry.
 
 ## Topic Configuration
 
-You can edit `topic_config.json` directly, use `/engine`, `/mode`, and `/stream`
-inside Telegram forum topics, or ask the `topic-setup` skill to configure
-topics.
+You can edit `topic_config.json` directly, use `/engine`, `/mode`, `/stream`,
+and `/model` (Antigravity topics) inside Telegram forum topics, or ask the
+`topic-setup` skill to configure topics.
 
 Terminology is important: config field `mode` means prompt mode. Telegram
 command `/mode` changes execution mode, stored as `exec_mode`.
@@ -267,13 +307,16 @@ Fields:
   config.
 - `stream_mode`: `verbose`, `live`, or `minimal`.
 - `exec_mode`: `tmux` or `subprocess`.
-- `engine`: `claude` or `codex`.
+- `engine`: `claude`, `codex`, or `antigravity`. Antigravity works in both
+  `tmux` and `subprocess` execution modes.
 - `model`: legacy single model override, or `null`.
-- `models`: optional per-engine overrides keyed by `claude` and/or `codex`.
+- `models`: optional per-engine overrides keyed by `claude`, `codex`, and/or
+  `antigravity`, for example `{"antigravity": "gemini-3.1-pro-high"}`.
   Resolution is `models[active_engine]`, then `model`, then the provider
   default; manual `/engine` changes preserve the map. During automatic
   missing-CLI fallback, the first fallback request uses the provider default;
-  the saved per-engine override applies from the next request.
+  the saved per-engine override applies from the next request. In
+  Antigravity topics `/model` writes `models.antigravity` for you.
 
 Use absolute paths for `cwd` and `mcp_config`. Keep `mcp_config` as `null` by
 default. Use a project MCP config only after checking it for secrets and private
@@ -305,8 +348,8 @@ and real customer context out of the public repository.
 Use `tmux` for real development work.
 
 The bot starts a persistent terminal session and sends your Telegram messages
-directly into Claude Code or Codex TUI. The session keeps context, can survive
-bot restarts, and can be inspected with `/tui`.
+directly into the Claude Code, Codex, or Antigravity TUI. The session keeps
+context, can survive bot restarts, and can be inspected with `/tui`.
 
 Use this when:
 
@@ -314,6 +357,11 @@ Use this when:
 - you want the agent to remember the long-running context;
 - the agent may ask permission questions or show interactive menus;
 - you want `/resume` and reply-to-session behavior.
+
+With Antigravity, the first run in a new working directory shows `agy`'s
+"trust this folder" dialog; the bot accepts it automatically because the
+operator chose that `cwd`. `agy` has no system-prompt flag, so the prompt mode
+and Telegram context are sent with the first message of a new conversation.
 
 `tmux` consumes resources while the session is alive. Use `/recycle` if a topic
 runtime is stuck but you want to keep resumable context; use `/kill` when you no
@@ -347,10 +395,10 @@ The normalized final answer is always sent as one separate logical response.
 
 `/tui` opens a snapshot of the live tmux pane and attaches control buttons.
 
-This exists because Claude Code and Codex CLIs are terminal applications. They
-can show permission prompts, menus, confirmations, model pickers, and other
-interactive UI. The bot can write into the terminal and read the transcript, but
-sometimes you need to see and steer the TUI directly.
+This exists because Claude Code, Codex, and Antigravity CLIs are terminal
+applications. They can show permission prompts, menus, confirmations, model
+pickers, and other interactive UI. The bot can write into the terminal and read
+the transcript, but sometimes you need to see and steer the TUI directly.
 
 Use `/tui` to:
 
@@ -380,6 +428,8 @@ part of that switch.
 
 Slash commands are special in tmux topics: non-bot commands such as `/model` or
 `/compact` are sent to the live TUI, not to the replied-to historical session.
+The one exception is `/model` in Antigravity topics, which the bot answers with
+its own model picker.
 
 `/clear` starts fresh logical context for the current topic. In tmux mode the
 bot resets or respawns the tmux session depending on the current state. `/new`
@@ -393,8 +443,13 @@ still exists as a legacy alias, but `/clear` is the command shown in the menu.
 - `/language`: show or switch UI language, for example `/language ru`.
 - `/mode`: forum topics only; choose `tmux` or `subprocess`. Switching from
   `tmux` to `subprocess` stops the active tmux session.
-- `/engine`: forum topics only; choose Claude Code or Codex. Changing engine
-  resets the active session.
+- `/engine`: forum topics only; choose Claude Code, Codex, or Antigravity.
+  Changing engine resets the active session.
+- `/model`: forum topics only; in Antigravity topics, choose a model from
+  `agy models` (the list depends on the signed-in plan) or "Default". The
+  choice is saved in the topic's `models` map and the conversation continues
+  on the new model. In Claude Code and Codex topics it explains how to set
+  `models` in `topic_config.json`.
 - `/codex_update`: update Codex CLI manually. It bypasses the automatic
   cooldown but is blocked by another bot-managed update in this process or
   bot-managed active Codex sessions. `/codex_update status` shows the last
@@ -445,6 +500,13 @@ an existing file, the bot uses it as the base config and injects the Telegram
 bot server into the runtime copy. If the path does not exist, use `null` or fix
 the path before relying on project-specific MCP tools.
 
+Antigravity has no per-run MCP flag. At start-up, when `agy` is installed, the
+bot registers its own MCP server named `bot` in `agy`'s global MCP config
+(an existing `bot` entry is left untouched). Each `agy` process gets its topic
+routing from its environment, and no secrets are written into `agy`'s config.
+Images created by `agy`'s built-in `generate_image` tool are sent to the chat
+automatically.
+
 ## Autostart With Systemd
 
 On a VPS, run the bot as a systemd service so it starts after reboot and
@@ -477,8 +539,9 @@ journalctl -u telegram-bot -f
 
 Systemd may have a smaller `PATH` than your shell. Before relying on the
 service, verify that the service user can run `uv`, `tmux`, and at least one of
-`claude` or `codex`. If the CLIs live in a user-local directory, add an
-`Environment=PATH=...` line to the unit or use absolute paths.
+`claude` or `codex` (plus `agy` if you use Antigravity topics). If the CLIs live
+in a user-local directory, add an `Environment=PATH=...` line to the unit or use
+absolute paths.
 
 If systemd stops retrying after repeated crashes:
 

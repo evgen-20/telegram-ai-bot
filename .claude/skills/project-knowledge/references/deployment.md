@@ -2,8 +2,11 @@
 
 This public repository has no centrally operated production environment and no
 project-owned deployment target. Each operator installs and runs their own bot
-on a host they control; the bot and the selected Claude Code or Codex CLI run
-as the same operator account on that host.
+on a host they control; the bot and the selected Claude Code, Codex, or
+Antigravity CLI run as the same operator account on that host. Antigravity
+sign-in is an interactive, per-host operator step: each host needs its own
+Google account, because signing one account in on several hosts or networks
+can trigger "User location is not supported" on a working host.
 
 Repository CI validates changes but does not deploy or publish an operator's
 installation. For a persistent Linux installation, the documented runtime is a

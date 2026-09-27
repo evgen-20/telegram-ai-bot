@@ -22,6 +22,9 @@ Common optional settings:
 - `DEEPGRAM_API_KEY`: enables voice transcription.
 - `TELEGRAM_CLAUDE_BIN` / `TELEGRAM_CODEX_BIN`: optional absolute CLI paths
   when the service user cannot resolve the binaries automatically.
+- `TELEGRAM_AGY_BIN`: optional absolute path to Antigravity CLI. It must be
+  owned by the service user and not group/world-writable; otherwise the bot
+  tries `~/.local/bin/agy`, then `PATH`.
 - `CODEX_AUTO_UPDATE_ENABLED`: enables automatic and manual Codex updates;
   defaults to `true`.
 - `CODEX_UPDATE_TIMEOUT_SEC`: update timeout; defaults to 180 seconds.
@@ -46,13 +49,17 @@ Topic fields:
   constraints.
 - `stream_mode`: `verbose`, `live`, or `minimal`.
 - `exec_mode`: `subprocess` or `tmux`.
-- `engine`: `claude` or `codex`.
+- `engine`: `claude`, `codex`, or `antigravity`. All three support both
+  `exec_mode` values.
 - `model`: legacy single model override.
-- `models`: optional per-engine overrides keyed by `claude` and/or `codex`.
+- `models`: optional per-engine overrides keyed by `claude`, `codex`, and/or
+  `antigravity` (for example `{"antigravity": "gemini-3.1-pro-high"}`).
   Resolution is `models[active_engine]`, then `model`, then the provider
   default; manual `/engine` changes preserve the map. During automatic
   missing-CLI fallback, the first fallback request uses the provider default;
-  the saved per-engine override applies from the next request.
+  the saved per-engine override applies from the next request. In
+  Antigravity topics `/model` lists `agy models` plus "Default" and writes
+  `models.antigravity`.
 
 Public prompt modes expose the generic bot MCP tools
 `send_message`, `send_image`, `send_image_gallery`, and `send_document`.
@@ -73,15 +80,22 @@ the topic to the available engine, persists that change, resets the active
 session id, and posts the same "engine changed, active session was reset" notice
 to the topic that a manual `/engine` switch would. The conversation never moves
 to a new provider silently. If neither CLI is installed, the bot still starts
-and tells the user to install Claude Code or Codex.
+and tells the user to install Claude Code or Codex. Antigravity is never part
+of this fallback: a topic set to `antigravity` without `agy` answers
+"Antigravity CLI not found", and no topic switches to Antigravity on its own.
 
 Voice transcription requires a Deepgram API key in `DEEPGRAM_API_KEY`; leave it
 empty to disable voice messages.
 
 Dotenv values are read without variable interpolation so credentials remain
-opaque. Bot-launched Claude Code and Codex processes receive a constrained
-allowlist of non-secret runtime variables rather than the bot's complete
-environment.
+opaque. Bot-launched Claude Code, Codex, and Antigravity processes receive a
+constrained allowlist of non-secret runtime variables rather than the bot's
+complete environment.
+
+Antigravity keeps its OAuth token in
+`~/.gemini/antigravity-cli/antigravity-oauth-token`. The bot never reads it;
+never commit, print, or copy it, and use one Google account per host. The bot
+registers its `bot` MCP server in `agy`'s global MCP config without secrets.
 
 Never commit `.env`, `.mcp*.json`, session JSON files, `tmux_sessions/`,
 `data/`, virtual environments, Python caches, or test/lint/typecheck caches.

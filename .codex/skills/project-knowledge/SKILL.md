@@ -1,9 +1,9 @@
 ---
 name: project-knowledge
 description: |
-  Public project knowledge for the Claude/Codex Telegram bot runtime:
-  architecture, topic config, runtime files, operator-owned deployment and direct access,
-  monitoring, recovery, testing, and release safety.
+  Public project knowledge for the Claude/Codex/Antigravity Telegram bot
+  runtime: architecture, topic config, runtime files, operator-owned deployment
+  and direct access, monitoring, recovery, testing, and release safety.
 
   Use when: "project architecture", "bot architecture", "topic config",
   "deployment", "install bot", "monitoring", "recovery", "direct host access",
@@ -14,7 +14,8 @@ description: |
 # Project Knowledge
 
 This repository is a generic open-source Telegram bot runtime for running
-Claude Code or Codex from Telegram chats and forum topics.
+Claude Code, Codex, or Antigravity CLI (`agy`) from Telegram chats and forum
+topics.
 
 Use this skill when you need repository-specific context. Keep all additions
 public-safe: no private assistant behavior, no personal workflows, no real IDs,

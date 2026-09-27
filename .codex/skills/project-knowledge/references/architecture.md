@@ -18,12 +18,15 @@ file alone does not make a mode runnable.
 
 Two independent runtime axes are important:
 
-- `engine`: `claude` or `codex`.
+- `engine`: `claude`, `codex`, or `antigravity`.
 - `exec_mode`: `subprocess` or `tmux`.
 
 Engine selection is availability-aware: Claude Code is preferred by default,
 Codex is used when Claude Code is missing and Codex exists, and the bot remains
 online with a user-facing install message when neither CLI is available.
+Antigravity is opt-in only: it never takes part in the automatic fallback, and
+a topic that selects it without an installed `agy` gets "Antigravity CLI not
+found" instead of an engine switch.
 
 `stream_mode` controls Telegram progress delivery:
 
@@ -120,3 +123,48 @@ Consequences to keep in mind:
   backend-routed and work for both.
 
 Protocol schemas vendored from the Codex CLI live in `docs/codex-protocol/`.
+
+## Antigravity backend (`agy`)
+
+Antigravity CLI is the third engine. It reuses the Claude-style transports
+rather than a separate backend: `BackendDispatcher` maps `antigravity` to the
+same backend as `claude`.
+
+- `core/services/antigravity.py` - owns everything `agy`-specific: binary
+  discovery (`TELEGRAM_AGY_BIN`, then `~/.local/bin/agy`, then `PATH`, with an
+  ownership/permission check), process environment (topic routing via
+  `TELEGRAM_CHAT_ID`/`TELEGRAM_THREAD_ID`), exec and TUI argv, the stream-json
+  parser `AntigravityExecParser`, the transcript parser
+  `AntigravityTranscriptParser`, pane detection (trust dialog, modal, prompt
+  ready), conversation discovery, `generate_image` output lookup, the
+  `agy models` list for `/model`, and bot MCP registration.
+- `core/services/claude.py` - the subprocess branch: runs
+  `agy -p ... --output-format stream-json`, feeds stdout to
+  `AntigravityExecParser`, and maps errors to friendly messages (not signed
+  in, "User location is not supported" as an account/region issue).
+- `core/services/tmux_manager.py` - the tmux branch: starts the `agy` TUI,
+  auto-accepts the "trust this folder" dialog for the operator-chosen cwd,
+  tails `~/.gemini/antigravity-cli/brain/<conversation_id>/.system_generated/logs/transcript_full.jsonl`
+  through `AntigravityTranscriptParser`, `/cancel` sends Esc, `/clear` starts a
+  fresh conversation, and `/recycle` restarts on the same one. Runner tag
+  `antigravity-tui-v1` lets sessions survive a bot restart.
+
+Notes:
+
+- `agy` has no system-prompt flag, so the prompt mode and Telegram context go
+  with the first message of a new conversation.
+- A new tmux conversation's id is discovered by snapshotting existing
+  conversations before the send and matching the new transcript's user input
+  against the prompt text.
+- `agy` has no per-run MCP flag. At start-up the bot registers a `bot` MCP
+  server in `agy`'s global MCP config (`agy mcp add ... bot bash
+  <repo>/mcp-servers/bot/start.sh`) unless a `bot` entry already exists; no
+  secrets are written there, routing comes from each process environment.
+- Only images produced by the built-in `generate_image` tool are forwarded to
+  Telegram, never images the agent merely viewed.
+- `/model` stores `models.antigravity` and continues the same conversation:
+  subprocess on the next message, tmux by recycling the live pane.
+- The bot never reads `agy`'s OAuth token under `~/.gemini/antigravity-cli/`.
+
+Protocol reference: `docs/antigravity-protocol/README.md`. Design:
+`docs/superpowers/specs/2026-09-27-antigravity-engine-design.md`.

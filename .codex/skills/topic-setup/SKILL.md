@@ -30,11 +30,15 @@ Determine:
   - If no forum group can be discovered locally, ask the user for the forum
     group chat id instead of creating a private-chat topic.
 - Project path for the topic, if this is a project topic.
-- Desired `engine`: `claude` or `codex`. Prefer Claude Code when both are
-  installed. If the configured engine is missing and the other engine exists,
-  runtime switches the topic to the available engine.
+- Desired `engine`: `claude`, `codex`, or `antigravity`. Prefer Claude Code
+  when both Claude Code and Codex are installed. If the configured Claude/Codex
+  engine is missing and the other one exists, runtime switches the topic to the
+  available engine. `antigravity` (Antigravity CLI, `agy`) is opt-in only:
+  set it only on request, check `agy` is installed and signed in first, and
+  note that a missing `agy` makes the topic answer "Antigravity CLI not found"
+  instead of switching engines.
 - Desired `exec_mode`: `subprocess` for short tasks or `tmux` for persistent
-  coding sessions.
+  coding sessions. All three engines, including Antigravity, support both.
 - Desired `stream_mode`: usually `live`; alternatives are `verbose` and
   `minimal`.
 - Optional per-engine `models` map.
@@ -69,7 +73,7 @@ Users can also create topics manually in Telegram. When the running bot receives
 the forum-topic service message, it auto-registers the topic in
 `topic_config.json` with generic defaults. The default runtime engine is
 `claude`; Codex-only installations automatically switch new topics to
-`engine=codex` on first use.
+`engine=codex` on first use. Topics never become Antigravity automatically.
 
 ## Configure A Topic
 
@@ -134,10 +138,18 @@ before clearing `model`; if its provider is uncertain, ask the user.
 ```json
 {
   "models": {
-    "codex": "CODEX_MODEL_NAME"
+    "codex": "CODEX_MODEL_NAME",
+    "antigravity": "gemini-3.1-pro-high"
   }
 }
 ```
+
+Antigravity model names come from `agy models`; the list depends on the
+signed-in plan. In an Antigravity topic the user can also run `/model` in
+Telegram: it lists those models plus "Default", writes `models.antigravity`,
+and continues the same conversation on the new model (subprocess on the next
+message, a live tmux pane is recycled onto the same conversation). In Claude or
+Codex topics `/model` only explains how to set `models` in this file.
 
 Runtime resolution is `models[active_engine]`, then legacy `model`, then the
 provider default. Manual `/engine` changes preserve the map. During automatic

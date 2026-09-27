@@ -40,6 +40,8 @@ Blockers:
 - real tokens, API keys, passwords, or private IDs;
 - private assistant code or prompts;
 - personal paths;
+- CLI credentials, such as Antigravity's
+  `~/.gemini/antigravity-cli/antigravity-oauth-token` or copies of it;
 - runtime files;
 - generated Python artifacts;
 - private deployment assumptions;
